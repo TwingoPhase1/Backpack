@@ -1555,6 +1555,54 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
    * Analyse un e-mail d'un professeur ou membre du staff autorisé via function calling
    * pour mettre à jour l'emploi du temps ou rattacher un lien de visioconférence à un cours.
    */
+  private extractExplicitMailDateIso(text: string, referenceDate?: string): string | null {
+  const ref = referenceDate ? new Date(referenceDate) : new Date();
+  const refYear = isNaN(ref.getTime()) ? new Date().getFullYear() : ref.getFullYear();
+
+  const numMatch = text.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+  if (numMatch) {
+    const day = Number(numMatch[1]);
+    const month = Number(numMatch[2]);
+    let year = numMatch[3] ? Number(numMatch[3]) : refYear;
+    if (year < 100) year += 2000;
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  const monthsMap: Record<string, number> = {
+    janvier: 1, janv: 1,
+    fevrier: 2, fev: 2,
+    mars: 3,
+    avril: 4, avr: 4,
+    mai: 5,
+    juin: 6,
+    juillet: 7, juil: 7,
+    aout: 8,
+    septembre: 9, sept: 9,
+    octobre: 10, oct: 10,
+    novembre: 11, nov: 11,
+    decembre: 12, dec: 12,
+  };
+  const norm = text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const textMatch = norm.match(
+    /\b(\d{1,2})\s+(janvier|janv|fevrier|fev|mars|avril|avr|mai|juin|juillet|juil|aout|septembre|sept|octobre|oct|novembre|nov|decembre|dec)(?:\s+(\d{4}))?\b/
+  );
+  if (textMatch) {
+    const day = Number(textMatch[1]);
+    const month = monthsMap[textMatch[2]];
+    const year = textMatch[3] ? Number(textMatch[3]) : refYear;
+    if (month && day >= 1 && day <= 31) {
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  return null;
+}
+
   public async processMailForSchedule(
     userConfig: AIUserConfig,
     mail: {
@@ -1655,6 +1703,7 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
       }
     }
     const studentGroups = Array.from(groupsSet);
+    const explicitDateIso = this.extractExplicitMailDateIso(`${mail.subject}\n${mail.bodyText || ""}`, mail.date);
 
     const conversation: AIMessage[] = [
       {
@@ -1670,14 +1719,15 @@ Tu analyses un e-mail envoyé par un PROFESSEUR ou membre du STAFF AUTORISÉ.
 Ton rôle :
 1. Vérifier si cet e-mail annonce un changement d'emploi du temps (cours annulé, déplacé, nouvelle salle, rattrapage, examen, soutenance) OU contient un lien de visioconférence pour un cours (Zoom, Teams, BigBlueButton, Meet, Jitsi...).
 2. RÈGLE CRITIQUE DE CIBLAGE : Vérifie si le message concerne bien CET étudiant ou ses classes/groupes (${studentGroups.join(", ") || "son EDT"}). Si le mail vise explicitement un AUTRE groupe/classe (ex: "TP 1.1" alors que l'étudiant est en "TP 1.2 INIT", ou "BUT 2" alors qu'il est en "BUT 1") ou s'adresse nominativement à un autre étudiant, N'APPELLE AUCUN outil et réponds "AUCUNE_ACTION".
-3. Si l'e-mail concerne bien cet étudiant, ses groupes ou toute la promo : appelle d'abord \`find_schedule_events\` pour trouver le cours correspondant, puis utilise \`attach_visio_link\`, \`update_schedule_event\` ou \`create_schedule_event\`.
-4. Si l'e-mail ne concerne ni un changement d'EDT ni un lien visio, N'APPELLE AUCUN outil de modification et réponds simplement "AUCUNE_ACTION".`,
+3. RÈGLE IMPÉRATIVE DE DATE : Si l'e-mail mentionne une date précise (ex: "du 18/11/2026", "le 18 novembre"), tu DOIS cibler UNIQUEMENT le cours à cette date exacte (passe \`date: "YYYY-MM-DD"\` à \`find_schedule_events\`). Ne rattache JAMAIS une visio ou une modification à un cours d'une autre date (ex: la semaine suivante) si le cours de la date mentionnée est absent ou déjà passé.
+4. Si l'e-mail concerne bien cet étudiant, ses groupes ou toute la promo : appelle d'abord \`find_schedule_events\` pour trouver le cours correspondant, puis utilise \`attach_visio_link\`, \`update_schedule_event\` ou \`create_schedule_event\`.
+5. Si l'e-mail ne concerne ni un changement d'EDT ni un lien visio, N'APPELLE AUCUN outil de modification et réponds simplement "AUCUNE_ACTION".`,
       },
       {
         role: "user",
         content: `E-mail reçu le ${mail.date}
 De : ${mail.senderName || ""} <${mail.from}>
-Code ressource détecté : ${mail.resourceCode || "aucun"}
+Code ressource détecté : ${mail.resourceCode || "aucun"}${explicitDateIso ? `\nDate cible détectée dans le mail : ${explicitDateIso}` : ""}
 Objet : ${mail.subject}
 
 Contenu :
@@ -1734,9 +1784,13 @@ ${(mail.bodyText || "").slice(0, 3500)}`,
             args.reason || `Lien visio rattaché depuis le mail "${mail.subject}"`
           );
           if (!updated) return { error: `Cours ${args.eventId} introuvable` };
+          const evDateLabel = new Date(updated.start).toLocaleDateString("fr-FR", {
+            day: "2-digit",
+            month: "2-digit",
+          });
           actions.push({
             action: "visio_attached",
-            summary: `Visio rattachée à ${updated.summary}`,
+            summary: `Visio rattachée à ${updated.summary} (${evDateLabel})`,
             eventId: updated.id,
             visioUrl: updated.visioUrl,
           });
@@ -1830,12 +1884,16 @@ ${(mail.bodyText || "").slice(0, 3500)}`,
         const visioUrl = visioMatch[0].replace(/[.,;)]+$/, "");
         const codeMatch = fullText.match(/\b(R\d\.?\d{2}|SAE\s?\d\.?\d{2}|SAÉ\s?\d\.?\d{2})\b/i);
         const normCode = codeMatch ? codeMatch[1].toUpperCase().replace(/[\s.É]/g, (c) => (c === "É" ? "E" : "")) : "";
-        const nowMs = Date.now() - 2 * 60 * 60 * 1000;
-        const horizonMs = Date.now() + 7 * 24 * 60 * 60 * 1000;
+        const refMs = mail.date && !isNaN(new Date(mail.date).getTime()) ? new Date(mail.date).getTime() : Date.now();
+        const nowMs = refMs - 2 * 60 * 60 * 1000;
+        const horizonMs = refMs + 7 * 24 * 60 * 60 * 1000;
 
         const candidates = userDb
           .getScheduleEvents()
           .filter((ev) => {
+            if (explicitDateIso) {
+              return ev.start.startsWith(explicitDateIso);
+            }
             const t = new Date(ev.start).getTime();
             return t >= nowMs && t <= horizonMs;
           })
