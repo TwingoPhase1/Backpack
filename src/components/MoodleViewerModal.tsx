@@ -25,11 +25,10 @@ import {
 function isOptionSuggestedByAI(
   answer: string | undefined,
   labelHtml: string | undefined,
-  value: string | undefined
+  value: string | undefined,
+  decisionPick?: string
 ): boolean {
-  if (!answer) return false;
-  // Se concentrer sur la partie réponse (avant l'explication) si présente
-  const answerSection = answer.split(/\*\*\s*Explication/i)[0] || answer;
+  if (!answer && !decisionPick) return false;
   const normalize = (s: string) =>
     s
       .replace(/<[^>]+>/g, " ")
@@ -41,14 +40,24 @@ function isOptionSuggestedByAI(
       .replace(/\s+/g, " ")
       .trim();
 
-  const normAnswer = normalize(answerSection);
   const rawLabel = (labelHtml || value || "").replace(/<[^>]+>/g, " ").trim();
-  // Retirer un éventuel préfixe "a. " / "1. "
   const cleanedLabel = rawLabel.replace(/^(?:[a-z]\.|[0-9]+\.)\s*/i, "");
   const normLabel = normalize(cleanedLabel);
   if (!normLabel || normLabel.length < 2) return false;
 
-  return normAnswer.includes(normLabel);
+  if (decisionPick) {
+    const normPick = normalize(decisionPick.replace(/^(?:[a-z]\.|[0-9]+\.)\s*/i, ""));
+    if (normPick && normPick === normLabel) return true;
+  }
+
+  if (!answer) return false;
+  // Extraire uniquement le bloc Réponse (entre "Réponse :" et "Explication :") si présent
+  const respMatch = answer.match(/(?:\*\*|)?R[ée]ponse\s*:?\s*(?:\*\*|)?([\s\S]*?)(?=(?:\*\*|)?Explication|$)/i);
+  const answerSection = respMatch ? respMatch[1] : (answer.split(/\*\*\s*Explication/i)[0] || answer);
+
+  const normAnswer = normalize(answerSection);
+  const escaped = normLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\b)${escaped}(?:\\b|$)`).test(normAnswer);
 }
 
 export interface MoodleViewerTarget {
@@ -92,6 +101,8 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
         sources?: Array<{ title: string; url: string }>;
         provider?: string;
         webSearchUsed?: boolean;
+        decisionPick?: string;
+        decisionConfidence?: number;
       }
     >
   >({});
@@ -204,7 +215,14 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
       const attempt = await api.startMoodleQuiz(target.url);
       setQuizAttempt(attempt);
       initAnswersFromAttempt(attempt);
-      void handleAskQuizAIBatch(attempt.allQuestions?.length ? attempt.allQuestions : attempt.questions || []);
+      const allQ = attempt.allQuestions?.length ? attempt.allQuestions : attempt.questions || [];
+      if (allQ.length > 0) {
+        // Lancer la 1ère question immédiatement à part + toutes les autres en 1 seul batch en parallèle
+        void handleAskQuizAI(allQ[0]);
+        if (allQ.length > 1) {
+          void handleAskQuizAIBatch(allQ.slice(1));
+        }
+      }
     } catch (err: any) {
       setError(err.message || "Impossible de démarrer le questionnaire.");
     } finally {
@@ -317,6 +335,8 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
           sources: res.sources,
           provider: res.provider,
           webSearchUsed: res.webSearchUsed,
+          decisionPick: res.decisionPick,
+          decisionConfidence: res.decisionConfidence,
         },
       }));
     } catch (err: any) {
@@ -460,7 +480,7 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                       {q.inputs.map((inp, iIdx) => {
                         if (inp.kind === "radio") {
                           const checked = quizAnswers[inp.name] === inp.value;
-                          const isAiPick = isOptionSuggestedByAI(aiState?.answer, inp.labelHtml, inp.value);
+                          const isAiPick = isOptionSuggestedByAI(aiState?.answer, inp.labelHtml, inp.value, aiState?.decisionPick);
                           return (
                             <label
                               key={`${inp.name}-${iIdx}`}
@@ -498,7 +518,7 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                         if (inp.kind === "checkbox") {
                           const arr = Array.isArray(quizAnswers[inp.name]) ? (quizAnswers[inp.name] as string[]) : [];
                           const checked = inp.value !== undefined && arr.includes(inp.value);
-                          const isAiPick = isOptionSuggestedByAI(aiState?.answer, inp.labelHtml, inp.value);
+                          const isAiPick = isOptionSuggestedByAI(aiState?.answer, inp.labelHtml, inp.value, aiState?.decisionPick);
                           return (
                             <label
                               key={`${inp.name}-${iIdx}`}

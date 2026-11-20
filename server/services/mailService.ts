@@ -516,7 +516,62 @@ export class MailService {
 
       const bodyText = await ensureBodyText();
 
-      const prompt = `Analyse ce courriel universitaire et réponds STRICTEMENT en JSON valide (aucun texte autour) :
+      try {
+        // 1. Pré-classement ultra-rapide via gemini-decision-1 (0 token de sortie)
+        const decision = await aiService.triageMailWithDecision(aiConfig, {
+          from: item.from,
+          subject: item.subject,
+          bodyText,
+        });
+
+        if (decision) {
+          let aiScheduleActions: MailTriageMeta["aiScheduleActions"] = undefined;
+          let scheduleProcessed = true;
+
+          if (shouldCheckSchedule && isRecent && decision.needsScheduleCheck) {
+            scheduleProcessed = false;
+            try {
+              const schedRes = await aiService.processMailForSchedule(
+                aiService.resolveConfigForRole(aiConfig, "schedule_agent"),
+                {
+                  id: String(item.id),
+                  subject: item.subject || "",
+                  from: item.from || "",
+                  senderName: item.senderName || authorizedSender?.name,
+                  date: item.date || new Date().toISOString(),
+                  bodyText,
+                  resourceCode: item.resourceCode,
+                },
+                currentDb,
+                studentCtx
+              );
+              scheduleProcessed = true;
+              if (schedRes.actions.length > 0) {
+                aiScheduleActions = schedRes.actions;
+              }
+            } catch (e) {
+              console.warn(`[-] Traitement EDT IA ignoré pour ${item.id}:`, e);
+            }
+          }
+
+          const cleanSnippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 140);
+          const meta: MailTriageMeta = {
+            aiSummary: aiScheduleActions?.[0]?.summary || cleanSnippet || String(item.subject || "").slice(0, 140),
+            aiPriority: decision.priority,
+            aiCategory: decision.category,
+            aiActionRequired: decision.actionRequired,
+            aiTags: [decision.category],
+            triagedAt: new Date().toISOString(),
+            scheduleProcessed,
+            ...(aiScheduleActions ? { aiScheduleActions } : {}),
+          };
+          this.saveTriageEntry(creds?.username, key, meta);
+          triagedOutput[item.id] = meta;
+          continue;
+        }
+
+        // 2. Fallback LLM standard si gemini-decision-1 n'est pas disponible
+        const prompt = `Analyse ce courriel universitaire et réponds STRICTEMENT en JSON valide (aucun texte autour) :
 {
   "aiSummary": "Résumé très concis en 1 phrase (max 140 caractères)",
   "aiPriority": "low | normal | high | urgent",
@@ -530,7 +585,6 @@ Objet : ${item.subject || ""}
 Contenu :
 ${bodyText.slice(0, 2000)}`;
 
-      try {
         const triageAiConfig = aiService.resolveConfigForRole(aiConfig, "mail_triage");
         const tempConfig: AIUserConfig = { ...triageAiConfig, enableTools: false };
         const result = await aiService.chatWithAgent(

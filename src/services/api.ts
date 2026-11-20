@@ -597,6 +597,8 @@ export const api = {
     sources: Array<{ title: string; url: string }>;
     provider: string;
     webSearchUsed: boolean;
+    decisionPick?: string;
+    decisionConfidence?: number;
   }> {
     const res = await authFetch(`${API_BASE}/moodle/quiz/ai-help`, {
       method: "POST",
@@ -620,6 +622,8 @@ export const api = {
     >;
     provider: string;
     webSearchUsed: boolean;
+    decisionPick?: string;
+    decisionConfidence?: number;
   }> {
     const res = await authFetch(`${API_BASE}/moodle/quiz/ai-help-batch`, {
       method: "POST",

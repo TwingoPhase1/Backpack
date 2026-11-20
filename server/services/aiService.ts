@@ -949,6 +949,114 @@ export class AIService {
   }
 
   /**
+   * Récupère une clé API Google AI Studio disponible (provider google ou profils).
+   */
+  private getGoogleApiKey(userConfig: AIUserConfig): string | null {
+    const direct = userConfig.providers?.google?.apiKey?.trim();
+    if (direct) return direct;
+    const fromProfile = (userConfig.profiles || []).find((p) => p.provider === "google" && p.apiKey?.trim())?.apiKey?.trim();
+    return fromProfile || null;
+  }
+
+  /**
+   * Appelle l'API Gemini Decisions (gemini-decision-1) : 0 token de sortie, ~150-250ms.
+   */
+  public async callGeminiDecisions(
+    userConfig: AIUserConfig,
+    input: string,
+    questions: Record<
+      string,
+      {
+        type: "noul" | "choice" | "score";
+        instructions: string;
+        criteria?: Record<string, string>;
+      }
+    >
+  ): Promise<Record<string, any> | null> {
+    const apiKey = this.getGoogleApiKey(userConfig);
+    if (!apiKey) return null;
+
+    try {
+      const res = await fetch("https://generativelanguage.googleapis.com/v1beta/decisions", {
+        method: "POST",
+        headers: {
+          "x-goog-api-key": apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gemini-decision-1",
+          input: input.slice(0, 12000),
+          questions,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return null;
+      const data: any = await res.json();
+      return data?.answers || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Pré-classement ultra-rapide d'un courriel via gemini-decision-1 (0 token de sortie).
+   */
+  public async triageMailWithDecision(
+    userConfig: AIUserConfig,
+    mail: { from?: string; subject?: string; bodyText?: string }
+  ): Promise<{
+    priority: "low" | "normal" | "high" | "urgent";
+    category: string;
+    actionRequired: boolean;
+    needsScheduleCheck: boolean;
+  } | null> {
+    const input = `De : ${mail.from || ""}\nObjet : ${mail.subject || ""}\n\n${(mail.bodyText || "").slice(0, 3000)}`;
+    const answers = await this.callGeminiDecisions(userConfig, input, {
+      priority: {
+        type: "choice",
+        instructions: "Quelle est la priorité de cet e-mail universitaire pour un étudiant ?",
+        criteria: {
+          urgent: "Échéance imminente aujourd'hui/demain, examen, cours annulé ou action urgente.",
+          high: "Important pour les cours, devoirs, notes ou changements de planning.",
+          normal: "Information standard de cours ou administrative sans urgence.",
+          low: "Newsletter, annonce générale, publicité ou information secondaire.",
+        },
+      },
+      category: {
+        type: "choice",
+        instructions: "Quelle catégorie décrit le mieux cet e-mail ?",
+        criteria: {
+          "Action requise": "L'étudiant doit répondre, rendre un travail ou effectuer une démarche.",
+          "Planning": "Changement d'emploi du temps, annulation, déplacement, salle ou lien visio.",
+          "Cours": "Support de cours, TP, TD, ressources pédagogiques.",
+          "Notes": "Notes, évaluations, résultats Scodoc ou examens.",
+          "Administratif": "Scolarité, bourse, inscription, stage, vie étudiante.",
+          "Information": "Annonce générale ou information diverse.",
+        },
+      },
+      action_required: {
+        type: "noul",
+        instructions: "L'étudiant doit-il effectuer une action concrète ou répondre suite à ce mail ?",
+      },
+      needs_schedule_check: {
+        type: "noul",
+        instructions:
+          "Ce mail mentionne-t-il un changement d'emploi du temps (annulation, report, nouvelle salle, rattrapage) ou contient-il un lien de visioconférence ?",
+      },
+    });
+
+    if (!answers) return null;
+    const prio = answers.priority?.choice;
+    const cat = answers.category?.choice;
+    return {
+      priority: ["low", "normal", "high", "urgent"].includes(prio) ? prio : "normal",
+      category: typeof cat === "string" ? cat : "Information",
+      actionRequired: Number(answers.action_required?.noul ?? 0) >= 0.55,
+      needsScheduleCheck: Number(answers.needs_schedule_update?.noul ?? answers.needs_schedule_check?.noul ?? 0) >= 0.5,
+    };
+  }
+
+  /**
    * Teste la connexion à un provider IA
    */
   public async testProvider(
@@ -1038,7 +1146,22 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
       ...messages,
     ];
 
-    let maxIterations = userConfig.enableTools ? 5 : 1;
+    let effectiveEnableTools = userConfig.enableTools;
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    if (effectiveEnableTools && lastUserMsg?.content && (!lastUserMsg.images || lastUserMsg.images.length === 0)) {
+      const routing = await this.callGeminiDecisions(userConfig, lastUserMsg.content, {
+        needs_tools: {
+          type: "noul",
+          instructions:
+            "Le message de l'étudiant demande-t-il ses données universitaires personnelles (emploi du temps, notes, mails, devoirs, Moodle, CROUS, fichiers) ou de créer/enregistrer un contenu (diaporama, note, résumé, TD, QCM) ?",
+        },
+      });
+      if (routing && Number(routing.needs_tools?.noul ?? 1) < 0.25) {
+        effectiveEnableTools = false;
+      }
+    }
+
+    let maxIterations = effectiveEnableTools ? 5 : 1;
     let finalAssistantMessage: AIMessage | null = null;
 
     while (maxIterations > 0) {
@@ -1047,11 +1170,11 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
         provider,
         providerConfig,
         conversation,
-        userConfig.enableTools
+        effectiveEnableTools
       );
 
       // Si l'assistant demande d'appeler des outils
-      if (assistantReply.toolCalls && assistantReply.toolCalls.length > 0 && userConfig.enableTools) {
+      if (assistantReply.toolCalls && assistantReply.toolCalls.length > 0 && effectiveEnableTools) {
         conversation.push(assistantReply);
 
         for (const call of assistantReply.toolCalls) {
@@ -2489,7 +2612,12 @@ RÈGLES STRICTES :
       const json: any = await res.json().catch(() => ({}));
       if (res.ok && json?.candidates?.[0]) {
         const cand = json.candidates[0];
-        const answer = (cand.content?.parts || []).map((p: any) => p.text || "").join("").trim();
+        const parts = Array.isArray(cand.content?.parts) ? cand.content.parts : [];
+        const nonThoughtParts = parts.filter((p: any) => !p.thought && p.text);
+        const answer = (nonThoughtParts.length > 0 ? nonThoughtParts : parts)
+          .map((p: any) => p.text || "")
+          .join("")
+          .trim();
         const chunks = cand.groundingMetadata?.groundingChunks || [];
         const sources: Array<{ title: string; url: string }> = [];
         const seen = new Set<string>();
@@ -2599,6 +2727,8 @@ RÈGLES STRICTES :
     sources: Array<{ title: string; url: string }>;
     provider: string;
     webSearchUsed: boolean;
+    decisionPick?: string;
+    decisionConfidence?: number;
   }> {
     const choicesBlock =
       payload.choicesText.length > 0
@@ -2606,7 +2736,44 @@ RÈGLES STRICTES :
         : "";
 
     const promptText = `Tu es un assistant pédagogique universitaire. Réponds de manière précise, claire et concise en français à cette question de questionnaire Moodle.${choicesBlock}\n\nQuestion :\n${payload.questionText}\n\nDonne d'abord la réponse exacte (ou l'ordre exact / les bons choix), puis une brève explication factuelle.`;
-    return this.runPromptWithWebSearch(userConfig, promptText, payload.questionText);
+
+    // Lancer en parallèle gemini-decision-1 (choix calibré instantané) + le petit modèle avec recherche Web (pour les sources)
+    const canUseDecision = payload.choicesText.length >= 2 && payload.choicesText.length <= 25;
+    const decisionPromise = canUseDecision
+      ? (() => {
+          const criteria: Record<string, string> = {};
+          payload.choicesText.forEach((c, idx) => {
+            criteria[String(idx)] = c;
+          });
+          return this.callGeminiDecisions(userConfig, payload.questionText, {
+            pick: {
+              type: "choice",
+              instructions: "Sélectionne la bonne réponse à cette question.",
+              criteria,
+            },
+          });
+        })()
+      : Promise.resolve(null);
+
+    const [webRes, decisionAns] = await Promise.all([
+      this.runPromptWithWebSearch(userConfig, promptText, payload.questionText),
+      decisionPromise,
+    ]);
+
+    let decisionPick: string | undefined;
+    let decisionConfidence: number | undefined;
+    if (decisionAns?.pick?.choice !== undefined) {
+      const idx = Number(decisionAns.pick.choice);
+      if (!Number.isNaN(idx) && payload.choicesText[idx]) {
+        decisionPick = payload.choicesText[idx];
+        decisionConfidence = Number(decisionAns.pick.confidence || 0);
+      }
+    }
+
+    return {
+      ...webRes,
+      ...(decisionPick ? { decisionPick, decisionConfidence } : {}),
+    };
   }
 
   /**

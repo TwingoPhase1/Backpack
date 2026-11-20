@@ -729,13 +729,49 @@ async function prefetchAllQuizQuestions(
   const allQuestions = [...firstParsed.questions];
   const seenIds = new Set(allQuestions.map((q) => q.id));
 
-  // Extraire les URLs des autres pages depuis la navigation du quiz Moodle
+  // Extraire les URLs des autres pages depuis la navigation du quiz Moodle (href ou data-quiz-page)
   const pageUrls = new Set<string>();
-  const linkRegex = /href=["']([^"']*mod\/quiz\/attempt\.php\?[^"']*page=\d+[^"']*)["']/gi;
+  const linkRegex = /href=["']([^"']*attempt\.php\?[^"']*page=\d+[^"']*)["']/gi;
   let m: RegExpExecArray | null;
   while ((m = linkRegex.exec(firstHtml)) !== null) {
     const abs = new URL(m[1].replace(/&amp;/g, "&"), firstUrl).toString();
     if (abs !== firstUrl) pageUrls.add(abs);
+  }
+
+  const dataPageRegex = /data-quiz-page=["'](\d+)["']/gi;
+  let dp: RegExpExecArray | null;
+  while ((dp = dataPageRegex.exec(firstHtml)) !== null) {
+    try {
+      const u = new URL(firstUrl);
+      u.searchParams.set("page", dp[1]);
+      if (u.toString() !== firstUrl) pageUrls.add(u.toString());
+    } catch {}
+  }
+
+  // Fallback si la navigation ne contient pas de liens directs mais qu'il y a une page suivante
+  if (pageUrls.size === 0 && firstParsed.hasNextPage) {
+    for (let pNum = 1; pNum <= 15; pNum++) {
+      try {
+        const u = new URL(firstUrl);
+        u.searchParams.set("page", String(pNum));
+        const { html, finalUrl } = await fetchMoodleHtml(u.toString());
+        const parsed = parseQuizAttemptHtml(html, finalUrl, token);
+        if (!parsed.questions.length) break;
+        let added = 0;
+        for (const q of parsed.questions) {
+          if (!seenIds.has(q.id)) {
+            seenIds.add(q.id);
+            allQuestions.push(q);
+            added++;
+          }
+        }
+        if (added === 0 || !parsed.hasNextPage) break;
+      } catch {
+        break;
+      }
+    }
+    console.log(`[Moodle Quiz] Prefetch séquentiel : ${allQuestions.length} question(s) récupérée(s).`);
+    return { ...firstParsed, allQuestions };
   }
 
   const urlsToFetch = Array.from(pageUrls).slice(0, 15);
@@ -761,6 +797,7 @@ async function prefetchAllQuizQuestions(
     }
   }
 
+  console.log(`[Moodle Quiz] Prefetch : ${allQuestions.length} question(s) sur ${urlsToFetch.length + 1} page(s).`);
   return { ...firstParsed, allQuestions };
 }
 
