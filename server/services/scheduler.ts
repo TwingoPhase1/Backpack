@@ -229,6 +229,54 @@ export async function runFullAutoSync(includeMoodle = false): Promise<void> {
   }
 }
 
+const initialSyncRunningForUser = new Set<string>();
+
+export async function triggerInitialUserSync(username: string, password: string): Promise<void> {
+  if (!username || !password) return;
+  if (initialSyncRunningForUser.has(username)) return;
+
+  const targetDb = getUserDb(username);
+  const needsSchedule = targetDb.getScheduleEvents().length === 0;
+  const needsGrades = targetDb.getGrades().length === 0;
+  const needsMoodle = targetDb.getMoodleCourses().length === 0;
+
+  if (!needsSchedule && !needsGrades && !needsMoodle) {
+    return;
+  }
+
+  initialSyncRunningForUser.add(username);
+  try {
+    console.log(
+      `[Scheduler] 🚀 Synchronisation initiale post-connexion pour ${username} (EDT=${needsSchedule}, Notes=${needsGrades}, Moodle=${needsMoodle})...`
+    );
+    const target: SyncTarget = {
+      username,
+      password,
+      targetDb,
+    };
+
+    if (needsSchedule) {
+      await syncScheduleForTarget(target);
+      await syncMailScheduleForTarget(target);
+    }
+    if (needsGrades) {
+      await syncGradesForTarget(target);
+    }
+    if (needsMoodle) {
+      try {
+        await runMoodleScraper(false);
+        console.log(`[Scheduler] 📚 Synchronisation initiale Moodle terminée (${username}).`);
+      } catch (err: any) {
+        console.warn(`[Scheduler] Moodle initial sync (${username}) ignorée :`, err.message);
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Scheduler] Erreur lors de la sync initiale (${username}) :`, err.message);
+  } finally {
+    initialSyncRunningForUser.delete(username);
+  }
+}
+
 let isMailSyncRunning = false;
 const MAIL_SYNC_INTERVAL_MS = 3 * 60 * 1000;
 

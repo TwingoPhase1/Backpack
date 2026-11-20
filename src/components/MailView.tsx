@@ -208,12 +208,32 @@ export const MailView: React.FC<MailViewProps> = ({
   };
 
   useEffect(() => {
-    fetchMessages(false, imapFolder);
+    let cancelled = false;
+    fetchMessages(false, imapFolder).then(() => {
+      if (cancelled) return;
+      // Rafraîchissement silencieux en arrière-plan pour récupérer les tout derniers mails sans bloquer l'affichage
+      api
+        .getMailMessages(0, 0, true, imapFolder)
+        .then((data) => {
+          if (cancelled) return;
+          setMessages(data.messages);
+          setTotalCount(data.totalCount);
+          setUnreadCount(data.unreadCount);
+          const untriaged = data.messages.filter(
+            (m) => !m.aiSummary && !autoTriagedIdsRef.current.has(`${imapFolder}:${m.id}`)
+          );
+          if (untriaged.length > 0) {
+            handleRunAITriage(undefined, true, untriaged.slice(0, 6), imapFolder);
+          }
+        })
+        .catch(() => {});
+    });
     // Rafraîchissement automatique silencieux toutes les 60 secondes
     const interval = setInterval(() => {
       api
         .getMailMessages(0, 0, true, imapFolder)
         .then((data) => {
+          if (cancelled) return;
           setMessages(data.messages);
           setTotalCount(data.totalCount);
           setUnreadCount(data.unreadCount);
@@ -226,7 +246,10 @@ export const MailView: React.FC<MailViewProps> = ({
         })
         .catch(() => {});
     }, 60000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [imapFolder]);
 
   // Fetch full detail when selectedId changes

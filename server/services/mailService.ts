@@ -30,8 +30,14 @@ export interface MailTriageMeta {
   aiScheduleActions?: Array<{ action: string; summary: string; eventId?: string; visioUrl?: string }>;
 }
 
-const userMailCaches = new Map<string, { data: MailListResult; timestamp: number }>();
-const CACHE_TTL_MS = 60 * 1000;
+interface CachedMailEntry {
+  data: MailListResult;
+  timestamp: number;
+  isFullList: boolean;
+}
+
+const userMailCaches = new Map<string, CachedMailEntry>();
+const CACHE_TTL_MS = 3 * 60 * 1000;
 
 export class MailService {
   private getTriageFilePath(username?: string): string {
@@ -78,6 +84,100 @@ export class MailService {
       aiTags: meta.aiTags,
       aiScheduleActions: meta.aiScheduleActions,
     };
+  }
+
+  private getMailCacheFilePath(username?: string): string {
+    const safeUser = (username || "default").toLowerCase().replace(/[^a-z0-9_.-]/g, "_");
+    const dir = path.resolve(ROOT_DIR, "data/users", safeUser);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return path.resolve(dir, "mail_cache.json");
+  }
+
+  private loadDiskCache(username: string | undefined, folder: string): CachedMailEntry | undefined {
+    try {
+      const file = this.getMailCacheFilePath(username);
+      if (!fs.existsSync(file)) return undefined;
+      const parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
+      const entry = parsed?.[folder];
+      if (!entry || !entry.data || !Array.isArray(entry.data.messages)) return undefined;
+      return {
+        data: entry.data,
+        timestamp: typeof entry.timestamp === "number" ? entry.timestamp : 0,
+        isFullList: Boolean(entry.isFullList),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private saveDiskCache(username: string | undefined, folder: string, entry: CachedMailEntry): void {
+    try {
+      const file = this.getMailCacheFilePath(username);
+      let all: Record<string, CachedMailEntry> = {};
+      if (fs.existsSync(file)) {
+        try {
+          all = JSON.parse(fs.readFileSync(file, "utf-8")) || {};
+        } catch {
+          all = {};
+        }
+      }
+      all[folder] = entry;
+      fs.writeFileSync(file, JSON.stringify(all), "utf-8");
+    } catch {
+      // Ignore disk cache write errors
+    }
+  }
+
+  private updateCachedReadState(
+    username: string | undefined,
+    folder: string,
+    id: string,
+    isUnread: boolean
+  ): void {
+    const cacheKey = `${username || "default"}:${folder}`;
+    const entry = userMailCaches.get(cacheKey) || this.loadDiskCache(username, folder);
+    if (!entry) return;
+    let changed = false;
+    const messages = entry.data.messages.map((m) => {
+      if (String(m.id) === String(id) && m.isUnread !== isUnread) {
+        changed = true;
+        return { ...m, isUnread };
+      }
+      return m;
+    });
+    if (!changed) return;
+    const unreadCount = messages.filter((m) => m.isUnread).length;
+    const updated: CachedMailEntry = {
+      ...entry,
+      data: { ...entry.data, messages, unreadCount },
+    };
+    userMailCaches.set(cacheKey, updated);
+    if (updated.isFullList) {
+      this.saveDiskCache(username, folder, updated);
+    }
+  }
+
+  private removeCachedMessage(username: string | undefined, folder: string, id: string): void {
+    const cacheKey = `${username || "default"}:${folder}`;
+    const entry = userMailCaches.get(cacheKey) || this.loadDiskCache(username, folder);
+    if (!entry) return;
+    const before = entry.data.messages.length;
+    const messages = entry.data.messages.filter((m) => String(m.id) !== String(id));
+    if (messages.length === before) return;
+    const unreadCount = messages.filter((m) => m.isUnread).length;
+    const updated: CachedMailEntry = {
+      ...entry,
+      data: {
+        ...entry.data,
+        messages,
+        totalCount: Math.max(0, entry.data.totalCount - (before - messages.length)),
+        unreadCount,
+      },
+    };
+    userMailCaches.set(cacheKey, updated);
+    if (updated.isFullList) {
+      this.saveDiskCache(username, folder, updated);
+    }
   }
 
   private invalidateUserCache(username?: string) {
@@ -144,14 +244,29 @@ export class MailService {
     folder = "INBOX"
   ): Promise<MailListResult> {
     const cacheKey = `${creds?.username || "default"}:${folder}`;
-    const cached = userMailCaches.get(cacheKey);
     const triageMap = this.loadTriageMap(creds?.username);
 
-    if (!forceRefresh && cached && offset === 0 && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-      return {
-        ...cached.data,
-        messages: cached.data.messages.map((m) => this.enrichWithTriage(m, triageMap)),
-      };
+    if (!forceRefresh && offset === 0) {
+      let cached = userMailCaches.get(cacheKey);
+      if (!cached) {
+        cached = this.loadDiskCache(creds?.username, folder);
+        if (cached) {
+          userMailCaches.set(cacheKey, cached);
+        }
+      }
+
+      if (cached && cached.isFullList) {
+        const isFresh = Date.now() - cached.timestamp < CACHE_TTL_MS;
+        // Pour un appel complet (ouverture de la boîte mail), on renvoie immédiatement le cache disque
+        // même s'il date de >3 min (le front rafraîchira en silence si nécessaire), tant qu'on a un cache complet.
+        if (isFresh || limit === 0) {
+          const sliced = limit > 0 ? cached.data.messages.slice(0, limit) : cached.data.messages;
+          return {
+            ...cached.data,
+            messages: sliced.map((m) => this.enrichWithTriage(m, triageMap)),
+          };
+        }
+      }
     }
 
     const res = await this.runPython(
@@ -170,8 +285,42 @@ export class MailService {
       messages: enrichedMessages,
     };
 
-    if (offset === 0) {
-      userMailCaches.set(cacheKey, { data: result, timestamp: Date.now() });
+    if (offset === 0 && limit === 0) {
+      // Ne persister en cache complet que lorsque toute la boîte a été récupérée (limit === 0)
+      const entry: CachedMailEntry = {
+        data: result,
+        timestamp: Date.now(),
+        isFullList: true,
+      };
+      userMailCaches.set(cacheKey, entry);
+      this.saveDiskCache(creds?.username, folder, entry);
+    } else if (offset === 0 && limit > 0) {
+      // Un appel partiel (ex: scheduler avec limit=10) ne doit JAMAIS écraser le cache complet.
+      // Si un cache complet existe déjà, on fusionne les nouveaux messages éventuels en tête.
+      const existing = userMailCaches.get(cacheKey) || this.loadDiskCache(creds?.username, folder);
+      if (existing && existing.isFullList) {
+        const existingById = new Map(existing.data.messages.map((m) => [String(m.id), m]));
+        for (const m of enrichedMessages) {
+          existingById.set(String(m.id), m);
+        }
+        const incomingIds = new Set(enrichedMessages.map((m) => String(m.id)));
+        const merged = [
+          ...enrichedMessages,
+          ...existing.data.messages.filter((m) => !incomingIds.has(String(m.id))),
+        ];
+        const updated: CachedMailEntry = {
+          data: {
+            folder,
+            totalCount: Math.max(result.totalCount, merged.length),
+            unreadCount: result.unreadCount,
+            messages: merged,
+          },
+          timestamp: Date.now(),
+          isFullList: true,
+        };
+        userMailCaches.set(cacheKey, updated);
+        this.saveDiskCache(creds?.username, folder, updated);
+      }
     }
 
     return result;
@@ -184,7 +333,7 @@ export class MailService {
   ): Promise<MailDetail> {
     const res = await this.runPython(["--get", String(id), "--folder", folder], creds);
     const triageMap = this.loadTriageMap(creds?.username);
-    this.invalidateUserCache(creds?.username);
+    this.updateCachedReadState(creds?.username, folder, id, false);
     return this.enrichWithTriage(res.message, triageMap);
   }
 
@@ -217,7 +366,7 @@ export class MailService {
   ): Promise<{ success: boolean; id: string; isUnread: boolean }> {
     const flag = read ? "--mark-read" : "--mark-unread";
     const res = await this.runPython([flag, String(id), "--folder", folder], creds);
-    this.invalidateUserCache(creds?.username);
+    this.updateCachedReadState(creds?.username, folder, id, !read);
     return res;
   }
 
@@ -227,7 +376,7 @@ export class MailService {
     folder = "INBOX"
   ): Promise<{ success: boolean }> {
     const res = await this.runPython(["--delete", String(id), "--folder", folder], creds);
-    this.invalidateUserCache(creds?.username);
+    this.removeCachedMessage(creds?.username, folder, id);
     return res;
   }
 

@@ -52,13 +52,43 @@ interface DashboardProps {
   onMarkScheduleChangeRead?: (id?: string) => void;
 }
 
-function getAcademicYear(dateStr?: string | null): string {
-  if (!dateStr) return "2026-2027";
+function parseFlexibleDate(dateStr?: string | null): Date | null {
+  if (!dateStr) return null;
+  const frMatch = dateStr.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (frMatch) {
+    const d = new Date(Number(frMatch[3]), Number(frMatch[2]) - 1, Number(frMatch[1]));
+    return isNaN(d.getTime()) ? null : d;
+  }
   const d = new Date(dateStr);
-  if (isNaN(d.getTime())) return "2026-2027";
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function getAcademicYear(dateStr?: string | null): string | null {
+  const d = parseFlexibleDate(dateStr);
+  if (!d) return null;
   const year = d.getFullYear();
   const month = d.getMonth();
   return month >= 8 ? `${year}-${year + 1}` : `${year - 1}-${year}`;
+}
+
+function formatScheduleChangeDate(startStr?: string, endStr?: string): string {
+  if (!startStr) return "";
+  const start = new Date(startStr);
+  if (isNaN(start.getTime())) return "";
+  const datePart = start.toLocaleDateString("fr-FR", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  });
+  const startTime = start.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  if (endStr) {
+    const end = new Date(endStr);
+    if (!isNaN(end.getTime())) {
+      const endTime = end.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+      return `${datePart} · ${startTime} - ${endTime}`;
+    }
+  }
+  return `${datePart} · ${startTime}`;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({
@@ -110,13 +140,18 @@ export const Dashboard: React.FC<DashboardProps> = ({
       .finally(() => setLoadingCrous(false));
   }, []);
 
-  const currentYear = "2026-2027";
+  const now = new Date();
+  const currentYear = useMemo(() => {
+    const y = now.getFullYear();
+    return now.getMonth() >= 8 ? `${y}-${y + 1}` : `${y - 1}-${y}`;
+  }, []);
+  const currentSemester: 1 | 2 = now.getMonth() >= 8 || now.getMonth() === 0 ? 1 : 2;
+
   const currentEvents = useMemo(
     () => events.filter((e) => getAcademicYear(e.start) === currentYear),
-    [events]
+    [events, currentYear]
   );
 
-  const now = new Date();
   const todayStr = now.toDateString();
 
   const todayEvents = useMemo(
@@ -135,12 +170,21 @@ export const Dashboard: React.FC<DashboardProps> = ({
     [currentEvents]
   );
 
-  const displayedRecentGrades = useMemo(() => {
-    const filtered = recentGrades.filter((g) => getAcademicYear(g.date) === currentYear);
-    return (filtered.length > 0 ? filtered : recentGrades).slice(0, 4);
-  }, [recentGrades]);
+  const currentSemesterGrades = useMemo(() => {
+    return recentGrades.filter((g) => {
+      const year = getAcademicYear(g.date);
+      if (year && year !== currentYear) return false;
+      if (g.semester && g.semester !== currentSemester) return false;
+      return true;
+    });
+  }, [recentGrades, currentYear, currentSemester]);
 
-  const unreadGradesCount = recentGrades.filter((g) => !g.isRead).length;
+  const displayedRecentGrades = useMemo(
+    () => currentSemesterGrades.slice(0, 4),
+    [currentSemesterGrades]
+  );
+
+  const unreadGradesCount = currentSemesterGrades.filter((g) => !g.isRead).length;
   const unreadScheduleChanges = scheduleChanges.filter((c) => !c.isRead);
 
   const recentNotes = useMemo(
@@ -257,16 +301,29 @@ export const Dashboard: React.FC<DashboardProps> = ({
               )}
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {unreadScheduleChanges.slice(0, 4).map((chg) => (
-                <div
-                  key={chg.id}
-                  onClick={onOpenSchedule}
-                  className="bg-white border border-amber-200 rounded-xl px-3.5 py-2.5 text-xs cursor-pointer hover:bg-amber-50/40"
-                >
-                  <p className="font-bold text-slate-900 truncate">{chg.title}</p>
-                  <p className="text-[11px] text-slate-600 truncate mt-0.5">{chg.changeDescription}</p>
-                </div>
-              ))}
+              {unreadScheduleChanges.slice(0, 4).map((chg) => {
+                const dateLabel = formatScheduleChangeDate(chg.start, chg.end);
+                return (
+                  <div
+                    key={chg.id}
+                    onClick={onOpenSchedule}
+                    className="bg-white border border-amber-200 rounded-xl px-3.5 py-2.5 text-xs cursor-pointer hover:bg-amber-50/40"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-bold text-slate-900 truncate">{chg.title}</p>
+                      {dateLabel && (
+                        <span className="text-[11px] font-semibold text-amber-800 bg-amber-100/70 px-2 py-0.5 rounded-md shrink-0">
+                          {dateLabel}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-600 truncate mt-0.5">
+                      {chg.changeDescription}
+                      {chg.location ? ` • ${chg.location}` : ""}
+                    </p>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

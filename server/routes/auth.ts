@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authService } from "../services/authService.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import { triggerInitialUserSync } from "../services/scheduler.js";
 
 const router = Router();
 
@@ -26,6 +27,10 @@ router.post("/login", async (req, res) => {
 
     if (result.token) {
       res.setHeader("Set-Cookie", `cartable_token=${result.token}; Path=/; Max-Age=2592000; SameSite=Lax`);
+      const creds = authService.getUserCredentials(result.token);
+      if (creds) {
+        void triggerInitialUserSync(creds.username, creds.password);
+      }
     }
     res.json(result);
   } catch (error: any) {
@@ -50,6 +55,10 @@ router.post("/verify-2fa", async (req, res) => {
     });
 
     res.setHeader("Set-Cookie", `cartable_token=${token}; Path=/; Max-Age=2592000; SameSite=Lax`);
+    const creds = authService.getUserCredentials(token);
+    if (creds) {
+      void triggerInitialUserSync(creds.username, creds.password);
+    }
     res.json({ token, user });
   } catch (error: any) {
     res.status(401).json({ error: error.message || "Échec de la validation 2FA." });
@@ -85,6 +94,9 @@ router.post("/2fa/config", requireAuth, (req, res) => {
 
 // GET /api/auth/me
 router.get("/me", requireAuth, (req, res) => {
+  if (req.credentials) {
+    void triggerInitialUserSync(req.credentials.username, req.credentials.password);
+  }
   res.json(req.user);
 });
 

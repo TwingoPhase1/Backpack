@@ -104,6 +104,10 @@ export async function runMoodleScraper(forceLogin: boolean = false): Promise<Moo
         }
       }
 
+      if (code !== 0 || (db.getMoodleCourses().length === 0)) {
+        lastSyncTimestamp = 0;
+      }
+
       const errMsg = stderr || `Le scraper s'est terminé avec le code ${code}`;
       const errStatus: MoodleSyncStatus = {
         ...db.getMoodleSyncStatus(),

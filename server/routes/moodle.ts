@@ -85,7 +85,18 @@ router.get("/courses", (req, res) => {
   try {
     const currentDb = req.userDb || db;
     const courses = currentDb.getMoodleCourses();
-    const status = currentDb.getMoodleSyncStatus();
+    let status = currentDb.getMoodleSyncStatus();
+    const globalStatus = db.getMoodleSyncStatus();
+
+    if (courses.length === 0 && req.credentials) {
+      if (!globalStatus.isSyncing) {
+        void runMoodleScraper(false);
+      }
+      status = { ...status, isSyncing: true };
+    } else if (globalStatus.isSyncing) {
+      status = { ...status, isSyncing: true };
+    }
+
     res.json({ courses, status });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

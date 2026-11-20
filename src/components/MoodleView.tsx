@@ -38,25 +38,43 @@ export const MoodleView: React.FC<MoodleViewProps> = ({ resources, onOpenResourc
 
   useEffect(() => {
     let mounted = true;
-    setLoading(true);
-    Promise.all([
-      api.getMoodleCourses().catch(() => ({ courses: [], status: null })),
-      api.getMoodleAssignments().catch(() => ({ assignments: [], total: 0 })),
-    ])
-      .then(([coursesRes, assignRes]) => {
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    const loadMoodle = async (showSpinner: boolean) => {
+      if (showSpinner) setLoading(true);
+      try {
+        const [coursesRes, assignRes] = await Promise.all([
+          api.getMoodleCourses().catch(() => ({ courses: [], status: null })),
+          api.getMoodleAssignments().catch(() => ({ assignments: [], total: 0 })),
+        ]);
         if (!mounted) return;
         const list = coursesRes.courses || [];
         setCourses(list);
         setStatus(coursesRes.status || null);
         setAssignments(assignRes.assignments || []);
-        if (list.length > 0) setSelectedCourseId(list[0].id);
-      })
-      .finally(() => {
-        if (mounted) setLoading(false);
-      });
+        if (list.length > 0) {
+          setSelectedCourseId((prev) => prev || list[0].id);
+        }
+
+        const stillSyncing = Boolean(coursesRes.status?.isSyncing) || list.length === 0;
+        if (stillSyncing && !pollTimer) {
+          pollTimer = setInterval(() => {
+            void loadMoodle(false);
+          }, 3000);
+        } else if (!stillSyncing && pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      } finally {
+        if (mounted && showSpinner) setLoading(false);
+      }
+    };
+
+    void loadMoodle(true);
 
     return () => {
       mounted = false;
+      if (pollTimer) clearInterval(pollTimer);
     };
   }, []);
 
