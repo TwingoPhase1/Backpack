@@ -22,17 +22,6 @@ services:
       retries: 3
       start_period: 10s
 
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: cartable-cloudflared
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
-    networks:
-      - default
-      - plaudtodocs_qnote
-    depends_on:
-      - cartable
-
 networks:
   plaudtodocs_qnote:
     external: true
