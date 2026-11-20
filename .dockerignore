@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+.dockerignore
+data/users
+data/sessions.json
+data/.session_secret
+data/moodle_files
+data/temp_mail
+data/uploads
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db

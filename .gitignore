@@ -1,0 +1,29 @@
+﻿# Dependencies
+node_modules/
+
+# Production build
+dist/
+
+# Local Environment & Secrets
+.env
+.env.*
+!.env.example
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Runtime data & personal student storage
+data/*
+!data/.gitkeep
+test_user_*
+
+# TypeScript build info
+*.tsbuildinfo
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

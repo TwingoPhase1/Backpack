@@ -1,0 +1,2 @@
+# Dépendances Python pour Cartable Numérique
+requests>=2.31.0
