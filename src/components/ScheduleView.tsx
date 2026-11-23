@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from "react";
 import { ScheduleEvent, Resource } from "../types";
+import { formatCourseTitle } from "../utils/scheduleFormat";
 import {
   ChevronLeft,
   ChevronRight,
@@ -396,7 +397,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                           Annulé
                         </span>
                       )}
-                      {evt.summary}
+                      {formatCourseTitle(evt.summary, evt.matchedCode, resources)}
                     </h3>
 
                     <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600 mb-3">
@@ -623,7 +624,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                                 evt.isCancelled ? "line-through text-rose-600" : "text-slate-900"
                               }`}
                             >
-                              {evt.summary}
+                              {formatCourseTitle(evt.summary, evt.matchedCode, resources)}
                             </h4>
                           </div>
 
@@ -681,7 +682,11 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       {selectedEvent.type}
                     </span>
                   </div>
-                  <h3 className="font-bold text-lg text-slate-900">{selectedEvent.summary}</h3>
+                  <h3 className="font-bold text-lg text-slate-900">
+                    {formatCourseTitle(selectedEvent.summary, selectedEvent.matchedCode, resources, {
+                      includeCode: true,
+                    })}
+                  </h3>
                 </div>
                 <button
                   onClick={() => setSelectedEvent(null)}

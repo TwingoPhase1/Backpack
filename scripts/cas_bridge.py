@@ -341,60 +341,82 @@ def login_cas_with_bridge(
     clean_totp = normalize_totp_secret(totp_secret or "")
 
     # Déterminer l'ordre de priorité : Grille et TOTP
-    order = []
     if preferred_method == "totp":
         order = ["totp", "passcode_grid"]
     else:
         order = ["passcode_grid", "totp"]
 
-    resolved_code = None
-    used_method = None
+    last_2fa_error = None
 
     for m in order:
+        candidate_code = None
         if m == "passcode_grid" and grid_active and parsed_grid:
-            row_idx, col_idx = request_grid_challenge(session, ctx)
-            resolved_code = resolve_grid_code(parsed_grid, row_idx, col_idx)
-            used_method = "passcode_grid"
-            break
-        if m == "totp" and totp_active and clean_totp:
-            resolved_code = generate_totp(clean_totp)
-            used_method = "totp"
-            break
+            try:
+                row_idx, col_idx = request_grid_challenge(session, ctx)
+                candidate_code = resolve_grid_code(parsed_grid, row_idx, col_idx)
+            except Exception:
+                candidate_code = None
+        elif m == "totp" and totp_active and clean_totp:
+            try:
+                candidate_code = generate_totp(clean_totp)
+            except Exception:
+                candidate_code = None
+
+        if not candidate_code:
+            continue
+
+        res_2fa = submit_2fa_code(session, login_url, ctx["execution"], candidate_code, cas_base)
+        if res_2fa.get("success"):
+            final_resp = res_2fa["response"]
+            return {
+                "success": True,
+                "response": final_resp,
+                "name": extract_student_name(final_resp.text, username),
+                "method": m,
+            }
+
+        last_2fa_error = res_2fa.get("error", "Échec validation 2FA.")
+        # Mettre à jour le contexte MFA (nouveau jeton execution) pour pouvoir tenter la méthode suivante ou le défi interactif
+        if res_2fa.get("response") is not None:
+            next_ctx = extract_mfauth_context(res_2fa["response"].text)
+            if next_ctx:
+                ctx = next_ctx
 
     # Si un code ponctuel a été passé directement
-    if not resolved_code and otp_code:
-        resolved_code = str(otp_code).strip()
+    if otp_code:
         used_method = preferred_method or ("totp" if totp_active else "passcode_grid")
+        res_2fa = submit_2fa_code(session, login_url, ctx["execution"], str(otp_code).strip(), cas_base)
+        if res_2fa.get("success"):
+            final_resp = res_2fa["response"]
+            return {
+                "success": True,
+                "response": final_resp,
+                "name": extract_student_name(final_resp.text, username),
+                "method": used_method,
+            }
+        return {"success": False, "error": res_2fa.get("error", "Échec validation 2FA.")}
 
-    if resolved_code:
-        res_2fa = submit_2fa_code(session, login_url, ctx["execution"], resolved_code, cas_base)
-        if not res_2fa.get("success"):
-            return {"success": False, "error": res_2fa.get("error", "Échec validation 2FA.")}
-        final_resp = res_2fa["response"]
-        return {
-            "success": True,
-            "response": final_resp,
-            "name": extract_student_name(final_resp.text, username),
-            "method": used_method,
-        }
-
-    # Sinon : aucune méthode automatique configurée -> demander au front-end (défi interactif)
+    # Sinon : aucune méthode automatique n'a abouti -> demander au front-end (défi interactif)
     grid_cell = None
     if grid_active:
-        row_idx, col_idx = request_grid_challenge(session, ctx)
-        grid_cell = {
-            "row": chr(65 + row_idx),
-            "col": col_idx + 1,
-            "rowIndex": row_idx,
-            "colIndex": col_idx,
-            "label": f"{chr(65 + row_idx)}{col_idx + 1}",
-        }
+        try:
+            row_idx, col_idx = request_grid_challenge(session, ctx)
+            grid_cell = {
+                "row": chr(65 + row_idx),
+                "col": col_idx + 1,
+                "rowIndex": row_idx,
+                "colIndex": col_idx,
+                "label": f"{chr(65 + row_idx)}{col_idx + 1}",
+            }
+        except Exception:
+            grid_cell = None
 
     return {
         "success": False,
         "requires2FA": True,
         "methods": available_methods,
         "gridCell": grid_cell,
+        "warning": last_2fa_error,
         "challenge": {
             "loginUrl": login_url,
             "casBase": cas_base,

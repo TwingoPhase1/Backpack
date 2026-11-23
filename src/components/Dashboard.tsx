@@ -11,6 +11,7 @@ import {
   CrousMenuResponse,
 } from "../types";
 import { api } from "../services/api";
+import { formatCourseTitle } from "../utils/scheduleFormat";
 import {
   Calendar,
   Clock,
@@ -310,7 +311,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
                     className="bg-white border border-amber-200 rounded-xl px-3.5 py-2.5 text-xs cursor-pointer hover:bg-amber-50/40"
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <p className="font-bold text-slate-900 truncate">{chg.title}</p>
+                      <p className="font-bold text-slate-900 truncate">
+                        {formatCourseTitle(chg.title, chg.matchedCode, resources, { includeCode: true })}
+                      </p>
                       {dateLabel && (
                         <span className="text-[11px] font-semibold text-amber-800 bg-amber-100/70 px-2 py-0.5 rounded-md shrink-0">
                           {dateLabel}
@@ -376,7 +379,11 @@ export const Dashboard: React.FC<DashboardProps> = ({
                         })}
                       </span>
                     </div>
-                    <h3 className="text-base font-bold text-slate-900 truncate">{nextCourse.summary}</h3>
+                    <h3 className="text-base font-bold text-slate-900 truncate">
+                      {formatCourseTitle(nextCourse.summary, nextCourse.matchedCode, resources, {
+                        includeCode: true,
+                      })}
+                    </h3>
                     <p className="text-xs text-slate-600 flex items-center gap-3 flex-wrap">
                       {nextCourse.location && (
                         <span className="flex items-center gap-1">
@@ -423,7 +430,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
                           {new Date(ev.start).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })} –{" "}
                           {new Date(ev.end).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
                         </span>
-                        <span className="font-semibold text-slate-800 truncate">{ev.summary}</span>
+                        <span className="font-semibold text-slate-800 truncate">
+                          {formatCourseTitle(ev.summary, ev.matchedCode, resources)}
+                        </span>
                       </div>
                       <span className="text-[11px] text-slate-500 shrink-0">{ev.location || ""}</span>
                     </div>

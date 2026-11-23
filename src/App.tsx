@@ -55,7 +55,6 @@ function MainContent() {
   const [showAccountModal, setShowAccountModal] = useState(false);
   const [showAIConfigModal, setShowAIConfigModal] = useState(false);
   const [showAICopilotDrawer, setShowAICopilotDrawer] = useState(false);
-  const [toasts, setToasts] = useState<AppToastNotification[]>([]);
   const [notifPermission, setNotifPermission] = useState<NotificationPermission>(getNotificationPermission());
 
   const seenStateRef = useRef<{
@@ -74,11 +73,14 @@ function MainContent() {
 
   const pushNotification = useCallback((notif: Omit<AppToastNotification, "id"> & { id?: string }) => {
     const id = notif.id || `${notif.category}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    setToasts((prev) => [{ ...notif, id }, ...prev].slice(0, 5));
-    sendBrowserNotification(notif.title, { body: notif.body, tag: id });
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 10000);
+    const nativeNotif = sendBrowserNotification(notif.title, { body: notif.body, tag: id });
+    if (nativeNotif && notif.onClick) {
+      nativeNotif.onclick = () => {
+        window.focus();
+        notif.onClick?.();
+        nativeNotif.close();
+      };
+    }
   }, []);
 
   // Navigation & Mobile Drawer State
@@ -667,10 +669,10 @@ function MainContent() {
         onNavigateToMail={() => setActiveView("mail")}
       />
 
-      {/* Notifications temps réel (Mails, Notes, Emploi du temps, Devoirs) */}
+      {/* Demande d'activation des notifications natives uniquement (aucun toast in-app) */}
       <NotificationToasts
-        toasts={toasts}
-        onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))}
+        toasts={[]}
+        onDismiss={() => {}}
         permission={notifPermission}
         onPermissionChange={setNotifPermission}
       />
