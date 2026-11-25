@@ -79,7 +79,7 @@ def create_base_session():
     return s
 
 def load_cached_session(session):
-    """Charge les cookies sauvegardés pour réutiliser la session et éviter les connexions répétées."""
+    """Charge les cookies sauvegardés et teste directement la session tant qu'elle est acceptée par Moodle."""
     if not os.path.exists(SESSION_FILE):
         return False, None
 
@@ -89,11 +89,7 @@ def load_cached_session(session):
 
         cookies = data.get("cookies", {})
         sesskey = data.get("sesskey")
-        saved_at = data.get("saved_at", 0)
-
-        # Si le cookie a moins de 6 heures, on le teste
-        if time.time() - saved_at > 6 * 3600:
-            print("[*] Cache de session Moodle expiré (> 6h). Reconnexion nécessaire.")
+        if not cookies:
             return False, None
 
         for k, v in cookies.items():
@@ -101,11 +97,12 @@ def load_cached_session(session):
 
         print("[*] Vérification de la session en cache...")
         r = session.get(f"{ECAMPUS_BASE}/my/", allow_redirects=False, timeout=10)
-        if r.status_code == 200 and "login" not in r.url:
+        if r.status_code == 200 and "login" not in r.url and "cas.unicaen.fr/login" not in r.text:
             # Vérification du sesskey dans la page si non stocké
             m_sess = re.search(r'["\']sesskey["\']:\s*["\']([^"\']+)["\']', r.text)
             if m_sess:
                 sesskey = m_sess.group(1)
+            save_session(session, sesskey)
             print("[+] Session Moodle en cache valide ! Aucune ré-authentification CAS nécessaire.")
             return True, sesskey
     except Exception as e:

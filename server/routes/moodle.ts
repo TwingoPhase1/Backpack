@@ -243,8 +243,12 @@ router.post("/sync", async (req, res) => {
   try {
     const currentDb = req.userDb || db;
     const forceLogin = Boolean(req.body.forceLogin);
-    // Launch scraper
-    const status = await runMoodleScraper(forceLogin);
+    // Launch scraper (bypassing 5 min auto cooldown for manual refresh)
+    const status = await runMoodleScraper(forceLogin, true);
+    if (currentDb !== db && db.getMoodleCourses().length > 0) {
+      currentDb.updateMoodleCourses(db.getMoodleCourses());
+      currentDb.updateMoodleSyncStatus(status);
+    }
     const courses = currentDb.getMoodleCourses();
     res.json({ status, courses });
   } catch (error: any) {
@@ -1097,7 +1101,8 @@ router.post("/quiz/ai-help", async (req, res) => {
     });
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || "Erreur assistance IA" });
+    const formatted = aiService.formatFriendlyAIError(error);
+    res.status(formatted.statusCode).json({ error: formatted.message, saturated: formatted.isSaturated });
   }
 });
 
@@ -1118,7 +1123,8 @@ router.post("/quiz/ai-help-batch", async (req, res) => {
     const result = await aiService.answerQuizQuestionsBatchWithWebSearch(aiConfig, questions);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || "Erreur batch assistance IA" });
+    const formatted = aiService.formatFriendlyAIError(error);
+    res.status(formatted.statusCode).json({ error: formatted.message, saturated: formatted.isSaturated });
   }
 });
 

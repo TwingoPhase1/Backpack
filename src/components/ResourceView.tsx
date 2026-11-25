@@ -47,6 +47,7 @@ import {
   Sparkles,
   HelpCircle,
   FolderPlus,
+  RefreshCw,
 } from "lucide-react";
 
 interface ResourceViewProps {
@@ -77,6 +78,7 @@ export const ResourceView: React.FC<ResourceViewProps> = ({
   const [insertFn, setInsertFn] = useState<((tag: string) => void) | null>(null);
   const [moodleCourse, setMoodleCourse] = useState<MoodleCourse | null>(null);
   const [loadingMoodle, setLoadingMoodle] = useState(false);
+  const [syncingMoodle, setSyncingMoodle] = useState(false);
   const [selectedMoodleSectionId, setSelectedMoodleSectionId] = useState<string>("ALL");
   const [expandedMoodleSubsections, setExpandedMoodleSubsections] = useState<Record<string, boolean>>({});
   const [moodleViewerTarget, setMoodleViewerTarget] = useState<MoodleViewerTarget | null>(null);
@@ -121,6 +123,20 @@ export const ResourceView: React.FC<ResourceViewProps> = ({
     };
     fetchMoodle();
   }, [resource.code]);
+
+  const handleSyncMoodle = async () => {
+    if (syncingMoodle) return;
+    setSyncingMoodle(true);
+    try {
+      await api.syncMoodle(false);
+      const data = await api.getMoodleCourse(resource.code);
+      setMoodleCourse(data);
+    } catch (e) {
+      console.error("Erreur actualisation Moodle:", e);
+    } finally {
+      setSyncingMoodle(false);
+    }
+  };
 
   const handleCopyMarkdown = (title: string, url: string, id: string) => {
     const md = `[📄 ${title}](${url})`;
@@ -1171,6 +1187,16 @@ export const ResourceView: React.FC<ResourceViewProps> = ({
                       </div>
 
                       <div className="flex items-center gap-3 w-full md:w-auto justify-end border-t md:border-t-0 pt-4 md:pt-0 border-slate-100">
+                        <button
+                          type="button"
+                          onClick={handleSyncMoodle}
+                          disabled={syncingMoodle}
+                          className="px-3.5 py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-60"
+                          title="Actualiser le cours depuis E-Campus"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${syncingMoodle ? "animate-spin" : ""}`} />
+                          <span>{syncingMoodle ? "Synchro..." : "Actualiser"}</span>
+                        </button>
                         <div className="bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-center">
                           <div className="text-[11px] text-slate-500 font-medium">Documents &amp; Liens</div>
                           <div className="text-lg font-bold font-mono text-slate-900">{totalMoodleDocs}</div>

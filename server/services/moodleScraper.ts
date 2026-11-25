@@ -16,16 +16,21 @@ const SESSION_FILE = path.resolve(DATA_DIR, "moodle_session.json");
 
 let isSyncing = false;
 let lastSyncTimestamp = 0;
-const MIN_SYNC_INTERVAL_MS = 5 * 60 * 1000; // Cooldown anti-ban : 5 minutes minimum entre 2 scrapes
+const MIN_SYNC_INTERVAL_MS = 5 * 60 * 1000; // Cooldown anti-ban : 5 minutes minimum entre 2 scrapes auto
+const MANUAL_SYNC_FLOOR_MS = 30 * 1000; // Plancher anti-spam de 30s sur rafraîchissement manuel
 
-export async function runMoodleScraper(forceLogin: boolean = false): Promise<MoodleSyncStatus> {
+export async function runMoodleScraper(
+  forceLogin: boolean = false,
+  bypassCooldown: boolean = false
+): Promise<MoodleSyncStatus> {
   if (isSyncing) {
     return db.getMoodleSyncStatus();
   }
 
-  // Protection Anti-Ban / Anti-DDoS : Cooldown de 5 minutes
-  if (!forceLogin && Date.now() - lastSyncTimestamp < MIN_SYNC_INTERVAL_MS) {
-    const remainingSec = Math.ceil((MIN_SYNC_INTERVAL_MS - (Date.now() - lastSyncTimestamp)) / 1000);
+  // Protection Anti-Ban / Anti-DDoS
+  const minInterval = bypassCooldown ? MANUAL_SYNC_FLOOR_MS : MIN_SYNC_INTERVAL_MS;
+  if (!forceLogin && Date.now() - lastSyncTimestamp < minInterval) {
+    const remainingSec = Math.ceil((minInterval - (Date.now() - lastSyncTimestamp)) / 1000);
     console.log(`[Anti-Ban Moodle] Requête ignorée pour préserver l'ENT (cooldown actif : encore ${remainingSec}s)`);
     return db.getMoodleSyncStatus();
   }
@@ -90,9 +95,17 @@ export async function runMoodleScraper(forceLogin: boolean = false): Promise<Moo
             };
             db.updateMoodleSyncStatus(status);
 
-            // Propager aussi aux bases utilisateurs actives
+            // Propager aussi aux bases utilisateurs actives et connues
+            const updatedUsers = new Set<string>();
             for (const active of authService.getActiveUsersWithCredentials()) {
+              updatedUsers.add(active.username);
               const userDb = getUserDb(active.username);
+              userDb.updateMoodleCourses(courses);
+              userDb.updateMoodleSyncStatus(status);
+            }
+            for (const u of authService.getAllUsers()) {
+              if (updatedUsers.has(u.username)) continue;
+              const userDb = getUserDb(u.username);
               userDb.updateMoodleCourses(courses);
               userDb.updateMoodleSyncStatus(status);
             }

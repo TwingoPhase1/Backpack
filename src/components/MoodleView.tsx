@@ -20,6 +20,7 @@ import {
   ChevronDown,
   ChevronRight,
   FolderPlus,
+  RefreshCw,
 } from "lucide-react";
 
 interface MoodleViewProps {
@@ -32,6 +33,7 @@ export const MoodleView: React.FC<MoodleViewProps> = ({ resources, onOpenResourc
   const [assignments, setAssignments] = useState<MoodleAssignment[]>([]);
   const [status, setStatus] = useState<MoodleSyncStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [search, setSearch] = useState("");
   const [selectedCourseId, setSelectedCourseId] = useState<number | null>(null);
   const [selectedSectionId, setSelectedSectionId] = useState<string>("ALL");
@@ -80,6 +82,24 @@ export const MoodleView: React.FC<MoodleViewProps> = ({ resources, onOpenResourc
       if (pollTimer) clearInterval(pollTimer);
     };
   }, []);
+
+  const handleSync = async () => {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      const [syncRes, assignRes] = await Promise.all([
+        api.syncMoodle(false),
+        api.getMoodleAssignments().catch(() => ({ assignments: [], total: 0 })),
+      ]);
+      if (syncRes?.courses) setCourses(syncRes.courses);
+      if (syncRes?.status) setStatus(syncRes.status);
+      if (assignRes?.assignments) setAssignments(assignRes.assignments);
+    } catch (e) {
+      console.error("Erreur actualisation Moodle:", e);
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const filteredCourses = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -149,15 +169,27 @@ export const MoodleView: React.FC<MoodleViewProps> = ({ resources, onOpenResourc
           </div>
         </div>
 
-        <div className="relative w-full sm:w-72">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Rechercher un cours, R104, SAE..."
-            className="w-full pl-9 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 focus:outline-none focus:border-emerald-600 focus:bg-white"
-          />
+        <div className="flex items-center gap-2 w-full sm:w-auto">
+          <button
+            type="button"
+            onClick={handleSync}
+            disabled={syncing}
+            className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer disabled:opacity-60"
+            title="Synchroniser les cours et fichiers depuis E-Campus"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${syncing ? "animate-spin" : ""}`} />
+            <span>{syncing ? "Synchronisation..." : "Actualiser"}</span>
+          </button>
+          <div className="relative w-full sm:w-64">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Rechercher un cours, R104, SAE..."
+              className="w-full pl-9 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 focus:outline-none focus:border-emerald-600 focus:bg-white"
+            />
+          </div>
         </div>
       </div>
 
