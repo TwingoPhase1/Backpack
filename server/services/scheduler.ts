@@ -141,21 +141,14 @@ async function syncMailScheduleForTarget(target: SyncTarget): Promise<void> {
   if (!aiConfig.enabled) return;
 
   try {
-    const res = await mailService.listMessages(15, 0, true, { username, password }, "INBOX");
+    const res = await mailService.getMessages(15, 0, true, { username, password }, "INBOX");
     if (res?.messages?.length > 0) {
-      await mailService.triageMessages(
-        res.messages.map((m) => ({
-          id: m.id,
-          messageId: m.messageId,
-          subject: m.subject,
-          from: m.from,
-          senderName: m.from,
-          date: m.date,
-          snippet: m.snippet,
-          resourceCode: m.resourceCode,
-        })),
-        { folder: "INBOX", creds: { username, password }, currentDb: targetDb, aiConfig }
-      );
+      await mailService.triageMessagesBatch(res.messages, {
+        folder: "INBOX",
+        creds: { username, password },
+        currentDb: targetDb,
+        aiConfig,
+      });
     }
   } catch (err: any) {
     console.warn(`[Scheduler] Analyse mails EDT (${username}) ignorée :`, err.message);
@@ -300,7 +293,7 @@ export async function runProactiveMailSync(): Promise<void> {
         const pending = (list.messages || []).filter((m) => {
           const key = m.messageId ? m.messageId.trim() : `uid:${m.id}`;
           const existing = triageMap[key];
-          if (!existing) return true;
+          if (!existing || existing.summaryVersion !== 3) return true;
           const isAuth = Boolean(target.targetDb.isAuthorizedSender(m.from || "", m.senderName));
           const isRecent = !m.date || new Date(m.date).getTime() >= sevenDaysAgo;
           return isAuth && isRecent && !existing.scheduleProcessed;

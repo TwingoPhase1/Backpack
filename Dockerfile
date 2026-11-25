@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Build du Frontend React avec Vite
 # ============================================================
-FROM node:20-bookworm-slim AS builder
+FROM node:24-bookworm-slim AS builder
 WORKDIR /app
 
 # Dépendances Node
@@ -15,7 +15,7 @@ RUN npm run build
 # ============================================================
 # Stage 2: Image de Production (Node.js + Python 3)
 # ============================================================
-FROM node:20-bookworm-slim AS runner
+FROM node:24-bookworm-slim AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production

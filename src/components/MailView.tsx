@@ -195,7 +195,7 @@ export const MailView: React.FC<MailViewProps> = ({
 
       // Lancement automatique du résumé & triage IA en arrière-plan pour les nouveaux messages
       const untriaged = data.messages.filter(
-        (m) => !m.aiSummary && !autoTriagedIdsRef.current.has(`${targetFolder}:${m.id}`)
+        (m) => !m.aiTriaged && !m.aiSummary && !autoTriagedIdsRef.current.has(`${targetFolder}:${m.id}`)
       );
       if (untriaged.length > 0) {
         handleRunAITriage(undefined, true, untriaged.slice(0, 6), targetFolder);
@@ -220,7 +220,7 @@ export const MailView: React.FC<MailViewProps> = ({
           setTotalCount(data.totalCount);
           setUnreadCount(data.unreadCount);
           const untriaged = data.messages.filter(
-            (m) => !m.aiSummary && !autoTriagedIdsRef.current.has(`${imapFolder}:${m.id}`)
+            (m) => !m.aiTriaged && !m.aiSummary && !autoTriagedIdsRef.current.has(`${imapFolder}:${m.id}`)
           );
           if (untriaged.length > 0) {
             handleRunAITriage(undefined, true, untriaged.slice(0, 6), imapFolder);
@@ -238,7 +238,7 @@ export const MailView: React.FC<MailViewProps> = ({
           setTotalCount(data.totalCount);
           setUnreadCount(data.unreadCount);
           const untriaged = data.messages.filter(
-            (m) => !m.aiSummary && !autoTriagedIdsRef.current.has(`${imapFolder}:${m.id}`)
+            (m) => !m.aiTriaged && !m.aiSummary && !autoTriagedIdsRef.current.has(`${imapFolder}:${m.id}`)
           );
           if (untriaged.length > 0) {
             handleRunAITriage(undefined, true, untriaged.slice(0, 6), imapFolder);
@@ -274,7 +274,7 @@ export const MailView: React.FC<MailViewProps> = ({
           setUnreadCount((c) => Math.max(0, c - 1));
         }
 
-        if (!detail.aiSummary && !autoTriagedIdsRef.current.has(`${imapFolder}:${detail.id}`)) {
+        if (!detail.aiTriaged && !detail.aiSummary && !autoTriagedIdsRef.current.has(`${imapFolder}:${detail.id}`)) {
           handleRunAITriage(detail, true, undefined, imapFolder);
         }
       } catch (e) {
@@ -362,7 +362,7 @@ export const MailView: React.FC<MailViewProps> = ({
       ? explicitTargets
       : singleMsg
       ? [singleMsg]
-      : messages.filter((m) => !m.aiSummary).slice(0, 6);
+      : messages.filter((m) => !m.aiTriaged && !m.aiSummary).slice(0, 6);
 
     if (targets.length === 0) return;
     targets.forEach((m) => autoTriagedIdsRef.current.add(`${targetFolder}:${m.id}`));
@@ -381,10 +381,12 @@ export const MailView: React.FC<MailViewProps> = ({
       );
       if (res.triaged) {
         setMessages((prev) =>
-          prev.map((m) => (res.triaged[m.id] ? { ...m, ...res.triaged[m.id] } : m))
+          prev.map((m) =>
+            res.triaged[m.id] ? { ...m, ...res.triaged[m.id], aiTriaged: true } : m
+          )
         );
         setSelectedDetail((prev) =>
-          prev && res.triaged[prev.id] ? { ...prev, ...res.triaged[prev.id] } : prev
+          prev && res.triaged[prev.id] ? { ...prev, ...res.triaged[prev.id], aiTriaged: true } : prev
         );
       }
     } catch (e: any) {
@@ -1234,13 +1236,14 @@ export const MailView: React.FC<MailViewProps> = ({
                   </div>
                 )}
 
-                {/* Encart Résumé IA */}
-                {selectedDetail.aiSummary ? (
+                {/* Encart Résumé / Action IA */}
+                {selectedDetail.aiSummary ||
+                (selectedDetail.aiScheduleActions && selectedDetail.aiScheduleActions.length > 0) ? (
                   <div className="rounded-xl bg-gradient-to-r from-indigo-50/80 to-blue-50/80 border border-indigo-200 p-3">
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2 text-xs font-bold text-indigo-900">
                         <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>Résumé IA</span>
+                        <span>{selectedDetail.aiSummary ? "Résumé IA" : "Action IA"}</span>
                         {selectedDetail.aiCategory && (
                           <span className="text-[10px] px-2 py-0.5 rounded-full bg-white text-indigo-700 border border-indigo-200 font-semibold">
                             {selectedDetail.aiCategory}
@@ -1256,9 +1259,15 @@ export const MailView: React.FC<MailViewProps> = ({
                     </div>
                     {showAISummaryBox && (
                       <div className="mt-1.5 space-y-2">
-                        <p className="text-xs text-indigo-950 leading-relaxed">{selectedDetail.aiSummary}</p>
+                        {selectedDetail.aiSummary && (
+                          <p className="text-xs text-indigo-950 leading-relaxed">{selectedDetail.aiSummary}</p>
+                        )}
                         {selectedDetail.aiScheduleActions && selectedDetail.aiScheduleActions.length > 0 && (
-                          <div className="flex flex-wrap gap-1.5 pt-1 border-t border-indigo-200/60">
+                          <div
+                            className={`flex flex-wrap gap-1.5 ${
+                              selectedDetail.aiSummary ? "pt-1 border-t border-indigo-200/60" : ""
+                            }`}
+                          >
                             {selectedDetail.aiScheduleActions.map((act, i) => (
                               <span
                                 key={i}

@@ -710,11 +710,68 @@ function parseQuizAttemptHtml(html: string, currentUrl: string, token?: string) 
     questions.push({ id: qId, number, textHtml, flagField, inputs });
   }
 
+  // Extraire la navigation officielle Moodle (quiznavbutton1..N) présente dans le bloc de droite de la page
+  const navMap = new Map<
+    string,
+    {
+      number: string;
+      pageIndex: number;
+      answered: boolean;
+      flagged: boolean;
+      isCurrent: boolean;
+      blocked: boolean;
+    }
+  >();
+  const currentPage = Number(hiddenFields.thispage || 0);
+  const navBtnRegex = /<(a|span|button)[^>]+id=["']quiznavbutton(\d+)["'][^>]*>/gi;
+  let nm: RegExpExecArray | null;
+  while ((nm = navBtnRegex.exec(html)) !== null) {
+    const tagName = nm[1].toLowerCase();
+    const tag = nm[0];
+    const numStr = nm[2];
+    const cls = extractAttr(tag, "class") || "";
+    const dpAttr = extractAttr(tag, "data-quiz-page");
+    const hrefAttr = extractAttr(tag, "href");
+
+    let pageIndex = currentPage;
+    if (dpAttr !== undefined && /^\d+$/.test(dpAttr.trim())) {
+      pageIndex = parseInt(dpAttr.trim(), 10);
+    } else if (hrefAttr) {
+      try {
+        const u = new URL(hrefAttr, currentUrl);
+        const p = u.searchParams.get("page");
+        pageIndex = p !== null && /^\d+$/.test(p) ? parseInt(p, 10) : 0;
+      } catch {
+        pageIndex = currentPage;
+      }
+    }
+
+    const answered = /\b(?:answersaved|complete|correct|partiallycorrect|incorrect)\b/i.test(cls);
+    const flagged = /\bflagged\b/i.test(cls);
+    const isCurrent = /\bthispage\b/i.test(cls);
+    const blocked =
+      /\bblocked\b/i.test(cls) || (tagName === "span" && !hrefAttr && dpAttr === undefined);
+
+    if (!navMap.has(numStr)) {
+      navMap.set(numStr, {
+        number: numStr,
+        pageIndex,
+        answered,
+        flagged,
+        isCurrent,
+        blocked,
+      });
+    }
+  }
+  const navItems = Array.from(navMap.values()).sort((a, b) => Number(a.number) - Number(b.number));
+
   return {
     attemptUrl: currentUrl,
     processUrl,
     hiddenFields,
     questions,
+    navItems,
+    currentPage,
     hasNextPage: hiddenFields.nextpage !== undefined && hiddenFields.nextpage !== "-1",
     hasPrevPage: hiddenFields.thispage !== undefined && hiddenFields.thispage !== "0",
   };
@@ -726,42 +783,81 @@ async function prefetchAllQuizQuestions(
   firstParsed: ReturnType<typeof parseQuizAttemptHtml>,
   token?: string
 ) {
-  const allQuestions = [...firstParsed.questions];
+  const firstPageIdx = Number(firstParsed.hiddenFields?.thispage || 0);
+  const allQuestions: Array<ReturnType<typeof parseQuizAttemptHtml>["questions"][number] & { pageIndex: number }> =
+    firstParsed.questions.map((q) => ({ ...q, pageIndex: firstPageIdx }));
   const seenIds = new Set(allQuestions.map((q) => q.id));
 
-  // Extraire les URLs des autres pages depuis la navigation du quiz Moodle (href ou data-quiz-page)
-  const pageUrls = new Set<string>();
-  const linkRegex = /href=["']([^"']*attempt\.php\?[^"']*page=\d+[^"']*)["']/gi;
+  let firstAttemptId: string | null = null;
+  try {
+    firstAttemptId = new URL(firstUrl).searchParams.get("attempt");
+  } catch {}
+
+  // Extraire les numéros de pages uniques depuis la navigation du quiz Moodle (href ou data-quiz-page)
+  const pageNums = new Set<number>();
+  const linkRegex = /href=["']([^"']*attempt\.php\?[^"']*)["']/gi;
   let m: RegExpExecArray | null;
   while ((m = linkRegex.exec(firstHtml)) !== null) {
-    const abs = new URL(m[1].replace(/&amp;/g, "&"), firstUrl).toString();
-    if (abs !== firstUrl) pageUrls.add(abs);
+    try {
+      const absUrl = new URL(m[1].replace(/&amp;/g, "&"), firstUrl);
+      const linkAttempt = absUrl.searchParams.get("attempt");
+      if (firstAttemptId && linkAttempt && linkAttempt !== firstAttemptId) continue;
+      const pageParam = absUrl.searchParams.get("page");
+      const pNum = pageParam !== null ? parseInt(pageParam, 10) : 0;
+      if (!Number.isNaN(pNum) && pNum >= 0) {
+        pageNums.add(pNum);
+      }
+    } catch {}
   }
 
   const dataPageRegex = /data-quiz-page=["'](\d+)["']/gi;
   let dp: RegExpExecArray | null;
   while ((dp = dataPageRegex.exec(firstHtml)) !== null) {
-    try {
-      const u = new URL(firstUrl);
-      u.searchParams.set("page", dp[1]);
-      if (u.toString() !== firstUrl) pageUrls.add(u.toString());
-    } catch {}
+    const pNum = parseInt(dp[1], 10);
+    if (!Number.isNaN(pNum) && pNum >= 0) {
+      pageNums.add(pNum);
+    }
   }
 
+  for (const item of firstParsed.navItems || []) {
+    if (!item.blocked && typeof item.pageIndex === "number" && item.pageIndex >= 0) {
+      pageNums.add(item.pageIndex);
+    }
+  }
+
+  if (firstPageIdx > 0) {
+    pageNums.add(0);
+  }
+  pageNums.delete(firstPageIdx);
+
+  const sortQuestions = () => {
+    allQuestions.sort((a, b) => {
+      const na = parseInt(a.number || "", 10);
+      const nb = parseInt(b.number || "", 10);
+      if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) {
+        return na - nb;
+      }
+      return a.pageIndex - b.pageIndex;
+    });
+  };
+
   // Fallback si la navigation ne contient pas de liens directs mais qu'il y a une page suivante
-  if (pageUrls.size === 0 && firstParsed.hasNextPage) {
-    for (let pNum = 1; pNum <= 15; pNum++) {
+  if (pageNums.size === 0 && firstParsed.hasNextPage) {
+    for (let pNum = 0; pNum <= 40; pNum++) {
+      if (pNum === firstPageIdx) continue;
       try {
         const u = new URL(firstUrl);
+        u.hash = "";
         u.searchParams.set("page", String(pNum));
         const { html, finalUrl } = await fetchMoodleHtml(u.toString());
         const parsed = parseQuizAttemptHtml(html, finalUrl, token);
         if (!parsed.questions.length) break;
+        const pageIdx = Number(parsed.hiddenFields?.thispage ?? pNum);
         let added = 0;
         for (const q of parsed.questions) {
           if (!seenIds.has(q.id)) {
             seenIds.add(q.id);
-            allQuestions.push(q);
+            allQuestions.push({ ...q, pageIndex: pageIdx });
             added++;
           }
         }
@@ -770,34 +866,67 @@ async function prefetchAllQuizQuestions(
         break;
       }
     }
+    sortQuestions();
     console.log(`[Moodle Quiz] Prefetch séquentiel : ${allQuestions.length} question(s) récupérée(s).`);
     return { ...firstParsed, allQuestions };
   }
 
-  const urlsToFetch = Array.from(pageUrls).slice(0, 15);
-  if (urlsToFetch.length > 0) {
-    const pages = await Promise.all(
-      urlsToFetch.map(async (u) => {
-        try {
-          const { html, finalUrl } = await fetchMoodleHtml(u);
-          return parseQuizAttemptHtml(html, finalUrl, token);
-        } catch {
-          return null;
+  const sortedPages = Array.from(pageNums)
+    .sort((a, b) => a - b)
+    .slice(0, 40);
+
+  const pageUrlMap = new Map<number, string>();
+  for (const pNum of sortedPages) {
+    try {
+      const u = new URL(firstUrl);
+      u.hash = "";
+      u.searchParams.set("page", String(pNum));
+      pageUrlMap.set(pNum, u.toString());
+    } catch {}
+  }
+
+  const fetchQuizPage = async (pNum: number, url: string) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { html, finalUrl } = await fetchMoodleHtml(url);
+        const parsed = parseQuizAttemptHtml(html, finalUrl, token);
+        if (parsed.questions.length > 0 || attempt === 1) {
+          const pageIndex = Number(parsed.hiddenFields?.thispage ?? pNum);
+          return { parsed, pageIndex };
         }
+      } catch {
+        if (attempt === 1) return null;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return null;
+  };
+
+  // Prefetch par lots de 3 requêtes concurrentes pour ne pas saturer le verrou de session PHP Moodle
+  const CONCURRENCY = 3;
+  for (let i = 0; i < sortedPages.length; i += CONCURRENCY) {
+    const batchNums = sortedPages.slice(i, i + CONCURRENCY);
+    const pages = await Promise.all(
+      batchNums.map((pNum) => {
+        const url = pageUrlMap.get(pNum);
+        return url ? fetchQuizPage(pNum, url) : Promise.resolve(null);
       })
     );
     for (const p of pages) {
       if (!p) continue;
-      for (const q of p.questions) {
+      for (const q of p.parsed.questions) {
         if (!seenIds.has(q.id)) {
           seenIds.add(q.id);
-          allQuestions.push(q);
+          allQuestions.push({ ...q, pageIndex: p.pageIndex });
         }
       }
     }
   }
 
-  console.log(`[Moodle Quiz] Prefetch : ${allQuestions.length} question(s) sur ${urlsToFetch.length + 1} page(s).`);
+  sortQuestions();
+  console.log(
+    `[Moodle Quiz] Prefetch : ${allQuestions.length} question(s) sur ${sortedPages.length + 1} page(s) unique(s).`
+  );
   return { ...firstParsed, allQuestions };
 }
 
@@ -885,7 +1014,7 @@ router.post("/quiz/start", async (req, res) => {
 // POST /api/moodle/quiz/submit
 router.post("/quiz/submit", async (req, res) => {
   try {
-    const { processUrl, hiddenFields, answers, action } = req.body || {};
+    const { processUrl, hiddenFields, answers, action, targetPage } = req.body || {};
     if (!processUrl || !String(processUrl).startsWith(ECAMPUS_BASE_URL + "/")) {
       return res.status(400).json({ error: "URL de soumission Moodle invalide" });
     }
@@ -906,7 +1035,10 @@ router.post("/quiz/submit", async (req, res) => {
       }
     }
 
-    if (action === "prev") {
+    if (action === "goto" && typeof targetPage === "number") {
+      params.set("nextpage", String(targetPage));
+      params.set("next", "1");
+    } else if (action === "prev") {
       params.set("previous", "Page précédente");
     } else if (action === "finish") {
       params.set("next", "Terminer le test...");
@@ -992,58 +1124,77 @@ router.post("/quiz/ai-help-batch", async (req, res) => {
 
 // GET /api/moodle/download?url=...
 // Proxy authentifié pour télécharger ou prévisualiser (?inline=1) les fichiers Moodle en 1 clic
-router.get("/download", (req, res) => {
+router.get("/download", async (req, res) => {
   const targetUrl = req.query.url as string;
   const inline = req.query.inline === "1" || req.query.inline === "true";
   const token = (req.query.token as string) || req.authToken;
+  const retried = req.query.retried === "1";
   if (!targetUrl || !targetUrl.startsWith(ECAMPUS_BASE_URL + "/")) {
     return res.status(400).json({ error: "URL de téléchargement invalide" });
   }
 
-  const cookieHeader = buildMoodleCookieHeader();
-  const parsed = new URL(targetUrl);
-  const options = {
-    hostname: parsed.hostname,
-    port: 443,
-    path: parsed.pathname + parsed.search,
-    method: "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Cookie": cookieHeader,
-      "Referer": ECAMPUS_BASE_URL + "/my/",
-    },
+  const performProxy = (urlToFetch: string, hasRetried: boolean) => {
+    const cookieHeader = buildMoodleCookieHeader();
+    const parsed = new URL(urlToFetch);
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path: parsed.pathname + parsed.search,
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Cookie": cookieHeader,
+        "Referer": ECAMPUS_BASE_URL + "/my/",
+      },
+    };
+
+    const proxyReq = https.request(options, async (proxyRes) => {
+      if (proxyRes.statusCode && proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
+        const redirectLocation = new URL(proxyRes.headers.location, urlToFetch).toString();
+        proxyRes.resume();
+        if (redirectLocation.includes("cas.unicaen.fr")) {
+          if (!hasRetried) {
+            try {
+              await runMoodleScraper(true);
+              return performProxy(urlToFetch, true);
+            } catch (e) {
+              if (!res.headersSent) return res.status(401).json({ error: "Session Moodle expirée" });
+              return;
+            }
+          }
+          if (!res.headersSent) return res.status(401).json({ error: "Session Moodle expirée" });
+          return;
+        }
+        const qs = new URLSearchParams({ url: redirectLocation });
+        if (inline) qs.set("inline", "1");
+        if (token) qs.set("token", token);
+        if (hasRetried) qs.set("retried", "1");
+        return res.redirect(`/api/moodle/download?${qs.toString()}`);
+      }
+
+      res.status(proxyRes.statusCode || 200);
+      for (const [key, val] of Object.entries(proxyRes.headers)) {
+        if (!val || ["set-cookie", "content-security-policy", "x-frame-options"].includes(key.toLowerCase())) continue;
+        if (inline && key.toLowerCase() === "content-disposition" && typeof val === "string") {
+          res.setHeader(key, val.replace(/^attachment/i, "inline"));
+        } else {
+          res.setHeader(key, val);
+        }
+      }
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on("error", (err) => {
+      console.error("[-] Proxy error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Erreur lors du téléchargement du fichier Moodle" });
+      }
+    });
+
+    proxyReq.end();
   };
 
-  const proxyReq = https.request(options, (proxyRes) => {
-    // Si redirection (ex: mod/resource/view.php vers pluginfile.php)
-    if (proxyRes.statusCode && proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-      const redirectLocation = new URL(proxyRes.headers.location, targetUrl).toString();
-      const qs = new URLSearchParams({ url: redirectLocation });
-      if (inline) qs.set("inline", "1");
-      if (token) qs.set("token", token);
-      return res.redirect(`/api/moodle/download?${qs.toString()}`);
-    }
-
-    res.status(proxyRes.statusCode || 200);
-    for (const [key, val] of Object.entries(proxyRes.headers)) {
-      if (!val || ["set-cookie", "content-security-policy", "x-frame-options"].includes(key.toLowerCase())) continue;
-      if (inline && key.toLowerCase() === "content-disposition" && typeof val === "string") {
-        res.setHeader(key, val.replace(/^attachment/i, "inline"));
-      } else {
-        res.setHeader(key, val);
-      }
-    }
-    proxyRes.pipe(res);
-  });
-
-  proxyReq.on("error", (err) => {
-    console.error("[-] Proxy error:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Erreur lors du téléchargement du fichier Moodle" });
-    }
-  });
-
-  proxyReq.end();
+  performProxy(targetUrl, retried);
 });
 
 export default router;

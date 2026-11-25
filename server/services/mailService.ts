@@ -6,6 +6,7 @@ import { MailMessage, MailDetail, MailSendPayload, AIUserConfig } from "../../sr
 import { aiService } from "./aiService.js";
 import { authService } from "./authService.js";
 import type { Database } from "../db.js";
+import { sqlite, withTransaction, getMeta, setMeta } from "../sqlite.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,12 +21,15 @@ interface MailListResult {
 }
 
 export interface MailTriageMeta {
-  aiSummary: string;
+  aiSummary?: string;
   aiPriority: "low" | "normal" | "high" | "urgent";
   aiCategory: string;
   aiActionRequired: boolean;
+  aiShouldNotify?: boolean;
+  aiNotifText?: string;
   aiTags?: string[];
   triagedAt: string;
+  summaryVersion?: number;
   scheduleProcessed?: boolean;
   aiScheduleActions?: Array<{ action: string; summary: string; eventId?: string; visioUrl?: string }>;
 }
@@ -38,33 +42,102 @@ interface CachedMailEntry {
 
 const userMailCaches = new Map<string, CachedMailEntry>();
 const CACHE_TTL_MS = 3 * 60 * 1000;
+const migratedTriageUsers = new Set<string>();
+const migratedCacheUsers = new Set<string>();
+
+const stmtSelectTriageAll = sqlite.prepare("SELECT message_key, data FROM mail_triage WHERE username = ?");
+const stmtUpsertTriage = sqlite.prepare(
+  "INSERT OR REPLACE INTO mail_triage (username, message_key, priority, category, action_required, should_notify, summary_version, triaged_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+);
+const stmtSelectMailCache = sqlite.prepare(
+  "SELECT timestamp, is_full_list, data FROM mail_cache WHERE username = ? AND folder = ?"
+);
+const stmtUpsertMailCache = sqlite.prepare(
+  "INSERT OR REPLACE INTO mail_cache (username, folder, timestamp, is_full_list, data) VALUES (?, ?, ?, ?, ?)"
+);
 
 export class MailService {
+  private normalizeUserKey(username?: string): string {
+    return (username || "_default").toLowerCase().trim();
+  }
+
   private getTriageFilePath(username?: string): string {
     const safeUser = (username || "default").toLowerCase().replace(/[^a-z0-9_.-]/g, "_");
-    const dir = path.resolve(ROOT_DIR, "data/users", safeUser);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return path.resolve(dir, "mail_triage.json");
+    return path.resolve(ROOT_DIR, "data/users", safeUser, "mail_triage.json");
+  }
+
+  private ensureTriageMigrated(username?: string): string {
+    const userKey = this.normalizeUserKey(username);
+    if (migratedTriageUsers.has(userKey)) return userKey;
+
+    const metaKey = `migrated_mail_triage:${userKey}`;
+    if (!getMeta(metaKey)) {
+      const legacyFile = this.getTriageFilePath(username);
+      if (fs.existsSync(legacyFile)) {
+        try {
+          const map = JSON.parse(fs.readFileSync(legacyFile, "utf-8")) as Record<string, MailTriageMeta>;
+          const entries = Object.entries(map || {});
+          if (entries.length > 0) {
+            withTransaction(() => {
+              for (const [key, meta] of entries) {
+                stmtUpsertTriage.run(
+                  userKey,
+                  key,
+                  meta.aiPriority || "normal",
+                  meta.aiCategory || "Information",
+                  meta.aiActionRequired ? 1 : 0,
+                  meta.aiShouldNotify === undefined ? null : meta.aiShouldNotify ? 1 : 0,
+                  meta.summaryVersion ?? null,
+                  meta.triagedAt ?? null,
+                  JSON.stringify(meta)
+                );
+              }
+            });
+            console.log(`[+] Migration SQLite mail_triage (${userKey}) : ${entries.length} entrée(s).`);
+          }
+        } catch (e) {
+          console.error("[-] Erreur migration mail_triage.json vers SQLite:", e);
+        }
+      }
+      setMeta(metaKey, "1");
+    }
+
+    migratedTriageUsers.add(userKey);
+    return userKey;
   }
 
   public loadTriageMap(username?: string): Record<string, MailTriageMeta> {
-    const file = this.getTriageFilePath(username);
-    if (!fs.existsSync(file)) return {};
+    const userKey = this.ensureTriageMigrated(username);
+    const out: Record<string, MailTriageMeta> = {};
     try {
-      return JSON.parse(fs.readFileSync(file, "utf-8"));
-    } catch {
-      return {};
+      const rows = stmtSelectTriageAll.all(userKey) as Array<{ message_key: string; data: string }>;
+      for (const row of rows) {
+        try {
+          out[row.message_key] = JSON.parse(row.data);
+        } catch {}
+      }
+    } catch (e) {
+      console.error("[-] Erreur lecture table mail_triage SQLite:", e);
     }
+    return out;
   }
 
   public saveTriageEntry(username: string | undefined, key: string, meta: MailTriageMeta) {
-    const file = this.getTriageFilePath(username);
-    const map = this.loadTriageMap(username);
-    map[key] = meta;
+    const userKey = this.ensureTriageMigrated(username);
     try {
-      fs.writeFileSync(file, JSON.stringify(map, null, 2), "utf-8");
+      stmtUpsertTriage.run(
+        userKey,
+        key,
+        meta.aiPriority || "normal",
+        meta.aiCategory || "Information",
+        meta.aiActionRequired ? 1 : 0,
+        meta.aiShouldNotify === undefined ? null : meta.aiShouldNotify ? 1 : 0,
+        meta.summaryVersion ?? null,
+        meta.triagedAt ?? null,
+        JSON.stringify(meta)
+      );
     } catch (e) {
-      console.error("[-] Erreur écriture mail_triage.json:", e);
+      console.error("[-] Erreur écriture table mail_triage SQLite:", e);
     }
   }
 
@@ -75,12 +148,16 @@ export class MailService {
   private enrichWithTriage<T extends MailMessage>(msg: T, triageMap: Record<string, MailTriageMeta>): T {
     const meta = triageMap[this.getMessageTriageKey(msg)] || triageMap[`uid:${msg.id}`];
     if (!meta) return msg;
+    const isV3 = meta.summaryVersion === 3;
     return {
       ...msg,
-      aiSummary: meta.aiSummary,
+      aiSummary: isV3 && meta.aiSummary ? meta.aiSummary : undefined,
+      aiTriaged: isV3,
       aiPriority: meta.aiPriority,
       aiCategory: meta.aiCategory,
       aiActionRequired: meta.aiActionRequired,
+      aiShouldNotify: isV3 ? meta.aiShouldNotify : undefined,
+      aiNotifText: isV3 && meta.aiNotifText ? meta.aiNotifText : undefined,
       aiTags: meta.aiTags,
       aiScheduleActions: meta.aiScheduleActions,
     };
@@ -88,22 +165,59 @@ export class MailService {
 
   private getMailCacheFilePath(username?: string): string {
     const safeUser = (username || "default").toLowerCase().replace(/[^a-z0-9_.-]/g, "_");
-    const dir = path.resolve(ROOT_DIR, "data/users", safeUser);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return path.resolve(dir, "mail_cache.json");
+    return path.resolve(ROOT_DIR, "data/users", safeUser, "mail_cache.json");
+  }
+
+  private ensureMailCacheMigrated(username?: string): string {
+    const userKey = this.normalizeUserKey(username);
+    if (migratedCacheUsers.has(userKey)) return userKey;
+
+    const metaKey = `migrated_mail_cache:${userKey}`;
+    if (!getMeta(metaKey)) {
+      const legacyFile = this.getMailCacheFilePath(username);
+      if (fs.existsSync(legacyFile)) {
+        try {
+          const all = JSON.parse(fs.readFileSync(legacyFile, "utf-8")) as Record<string, CachedMailEntry>;
+          const entries = Object.entries(all || {});
+          if (entries.length > 0) {
+            withTransaction(() => {
+              for (const [folder, entry] of entries) {
+                if (!entry?.data || !Array.isArray(entry.data.messages)) continue;
+                stmtUpsertMailCache.run(
+                  userKey,
+                  folder,
+                  typeof entry.timestamp === "number" ? entry.timestamp : 0,
+                  entry.isFullList ? 1 : 0,
+                  JSON.stringify(entry.data)
+                );
+              }
+            });
+            console.log(`[+] Migration SQLite mail_cache (${userKey}) : ${entries.length} dossier(s).`);
+          }
+        } catch (e) {
+          console.error("[-] Erreur migration mail_cache.json vers SQLite:", e);
+        }
+      }
+      setMeta(metaKey, "1");
+    }
+
+    migratedCacheUsers.add(userKey);
+    return userKey;
   }
 
   private loadDiskCache(username: string | undefined, folder: string): CachedMailEntry | undefined {
     try {
-      const file = this.getMailCacheFilePath(username);
-      if (!fs.existsSync(file)) return undefined;
-      const parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
-      const entry = parsed?.[folder];
-      if (!entry || !entry.data || !Array.isArray(entry.data.messages)) return undefined;
+      const userKey = this.ensureMailCacheMigrated(username);
+      const row = stmtSelectMailCache.get(userKey, folder) as
+        | { timestamp: number; is_full_list: number; data: string }
+        | undefined;
+      if (!row || typeof row.data !== "string") return undefined;
+      const data = JSON.parse(row.data) as MailListResult;
+      if (!data || !Array.isArray(data.messages)) return undefined;
       return {
-        data: entry.data,
-        timestamp: typeof entry.timestamp === "number" ? entry.timestamp : 0,
-        isFullList: Boolean(entry.isFullList),
+        data,
+        timestamp: typeof row.timestamp === "number" ? row.timestamp : 0,
+        isFullList: Boolean(row.is_full_list),
       };
     } catch {
       return undefined;
@@ -112,19 +226,16 @@ export class MailService {
 
   private saveDiskCache(username: string | undefined, folder: string, entry: CachedMailEntry): void {
     try {
-      const file = this.getMailCacheFilePath(username);
-      let all: Record<string, CachedMailEntry> = {};
-      if (fs.existsSync(file)) {
-        try {
-          all = JSON.parse(fs.readFileSync(file, "utf-8")) || {};
-        } catch {
-          all = {};
-        }
-      }
-      all[folder] = entry;
-      fs.writeFileSync(file, JSON.stringify(all), "utf-8");
+      const userKey = this.ensureMailCacheMigrated(username);
+      stmtUpsertMailCache.run(
+        userKey,
+        folder,
+        entry.timestamp,
+        entry.isFullList ? 1 : 0,
+        JSON.stringify(entry.data)
+      );
     } catch {
-      // Ignore disk cache write errors
+      // Ignore SQLite cache write errors
     }
   }
 
@@ -480,7 +591,7 @@ export class MailService {
         return "";
       };
 
-      if (existingMeta) {
+      if (existingMeta && existingMeta.summaryVersion === 3) {
         if (shouldCheckSchedule && isRecent && !existingMeta.scheduleProcessed) {
           try {
             const bodyText = await ensureBodyText();
@@ -514,22 +625,33 @@ export class MailService {
         continue;
       }
 
-      const bodyText = await ensureBodyText();
+      const rawBodyText = await ensureBodyText();
+      // Nettoyer les citations de réponses précédentes et signatures pour aider l'IA à synthétiser le cœur du message
+      const cleanedBodyForLLM = (() => {
+        let txt = rawBodyText.replace(/\r\n/g, "\n");
+        const quoteSplit = txt.search(/\n(?:Le [^\n]{6,80} a [ée]crit\s*:|On [^\n]{6,80} wrote:|----+ ?Message d['’]origine ?----+)/i);
+        if (quoteSplit > 60) txt = txt.slice(0, quoteSplit);
+        const sigSplit = txt.search(/\n--\s*\n|\nCordialement[\s,]*\n/i);
+        if (sigSplit > 60) txt = txt.slice(0, sigSplit);
+        return txt.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim().slice(0, 2500);
+      })();
+
+      const alreadyScheduleProcessed = Boolean(existingMeta?.scheduleProcessed);
+      const existingActions = existingMeta?.aiScheduleActions;
 
       try {
-        // 1. Pré-classement ultra-rapide via gemini-decision-1 (0 token de sortie)
+        // 1. Pré-classement ultra-rapide via gemini-decision-1 : décide aussi si un résumé est utile
         const decision = await aiService.triageMailWithDecision(aiConfig, {
           from: item.from,
           subject: item.subject,
-          bodyText,
+          bodyText: cleanedBodyForLLM,
         });
 
         if (decision) {
-          let aiScheduleActions: MailTriageMeta["aiScheduleActions"] = undefined;
-          let scheduleProcessed = true;
+          let aiScheduleActions: MailTriageMeta["aiScheduleActions"] = existingActions;
+          let scheduleProcessed = alreadyScheduleProcessed;
 
-          if (shouldCheckSchedule && isRecent && decision.needsScheduleCheck) {
-            scheduleProcessed = false;
+          if (shouldCheckSchedule && isRecent && !alreadyScheduleProcessed && (decision.needsScheduleCheck || hasScheduleKeyword)) {
             try {
               const schedRes = await aiService.processMailForSchedule(
                 aiService.resolveConfigForRole(aiConfig, "schedule_agent"),
@@ -539,7 +661,7 @@ export class MailService {
                   from: item.from || "",
                   senderName: item.senderName || authorizedSender?.name,
                   date: item.date || new Date().toISOString(),
-                  bodyText,
+                  bodyText: rawBodyText,
                   resourceCode: item.resourceCode,
                 },
                 currentDb,
@@ -554,14 +676,100 @@ export class MailService {
             }
           }
 
-          const cleanSnippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 140);
+          const shouldNotify = Boolean(decision.shouldNotify || (aiScheduleActions && aiScheduleActions.length > 0));
+          let aiSummary: string | undefined = undefined;
+          let aiNotifText: string | undefined = undefined;
+
+          if (shouldNotify) {
+            try {
+              const notifPrompt = `Analyse ce courriel universitaire important et réponds STRICTEMENT en JSON valide (aucun texte autour) :
+{
+  "aiSummary": "Résumé synthétique et factuel en UNE SEULE phrase claire en français (maximum 140 caractères). INTERDICTION de recopier le début du mail, les formules de politesse ou la signature.",
+  "aiNotifText": "Texte de notification ultra-concis et actionnable (maximum 85 caractères, style télégraphique direct, ex: 'TD R1.06 annulé demain 10h' ou 'Rendu SAE1.02 avant 18h')."
+}
+
+De : ${item.senderName ? `${item.senderName} <${item.from || ""}>` : (item.from || "")}
+Objet : ${item.subject || ""}
+Contenu :
+${cleanedBodyForLLM}`;
+              const triageAiConfig = aiService.resolveConfigForRole(aiConfig, "mail_triage");
+              const tempConfig: AIUserConfig = { ...triageAiConfig, enableTools: false };
+              const sumResult = await aiService.chatWithAgent(
+                tempConfig,
+                [{ role: "user", content: notifPrompt }],
+                currentDb,
+                creds
+              );
+              const raw = (sumResult.message.content || "").replace(/```json\s*|\s*```/g, "").trim();
+              const match = raw.match(/\{[\s\S]*\}/);
+              if (match) {
+                try {
+                  const parsedNotif = JSON.parse(match[0]);
+                  const cleanStr = (val: unknown, maxLen: number): string | undefined => {
+                    if (typeof val !== "string") return undefined;
+                    const s = val.replace(/^["«»\s]+|["«»\s]+$/g, "").replace(/\s+/g, " ").trim();
+                    return s ? s.slice(0, maxLen) : undefined;
+                  };
+                  aiSummary = cleanStr(parsedNotif.aiSummary, 180);
+                  aiNotifText = cleanStr(parsedNotif.aiNotifText, 100);
+                } catch {
+                  const cleanedFallback = raw.replace(/^["«»\s]+|["«»\s]+$/g, "").replace(/\s+/g, " ").trim();
+                  if (cleanedFallback) {
+                    aiSummary = cleanedFallback.slice(0, 180);
+                    aiNotifText = cleanedFallback.slice(0, 90);
+                  }
+                }
+              } else {
+                const cleanedFallback = raw.replace(/^["«»\s]+|["«»\s]+$/g, "").replace(/\s+/g, " ").trim();
+                if (cleanedFallback) {
+                  aiSummary = cleanedFallback.slice(0, 180);
+                  aiNotifText = cleanedFallback.slice(0, 90);
+                }
+              }
+            } catch (sumErr: any) {
+              console.warn(`[-] Résumé/notif IA ignoré pour ${item.id}:`, sumErr?.message || sumErr);
+            }
+          } else if (decision.needsSummary && cleanedBodyForLLM.length >= 160) {
+            try {
+              const summaryPrompt = `Résume ce courriel universitaire en UNE SEULE phrase claire et factuelle en français (maximum 140 caractères).
+Règles strictes :
+- Reformule l'essentiel (information clé, consigne, date ou décision).
+- INTERDICTION de recopier le début du mail, les formules de politesse ("Bonjour", "Bonne journée"), la signature ou des guillemets autour de la phrase.
+
+De : ${item.senderName ? `${item.senderName} <${item.from || ""}>` : (item.from || "")}
+Objet : ${item.subject || ""}
+Contenu :
+${cleanedBodyForLLM}`;
+              const triageAiConfig = aiService.resolveConfigForRole(aiConfig, "mail_triage");
+              const tempConfig: AIUserConfig = { ...triageAiConfig, enableTools: false };
+              const sumResult = await aiService.chatWithAgent(
+                tempConfig,
+                [{ role: "user", content: summaryPrompt }],
+                currentDb,
+                creds
+              );
+              const cleanedSum = (sumResult.message.content || "")
+                .replace(/^["«»\s]+|["«»\s]+$/g, "")
+                .replace(/\s+/g, " ")
+                .trim();
+              if (cleanedSum) {
+                aiSummary = cleanedSum.slice(0, 180);
+              }
+            } catch (sumErr: any) {
+              console.warn(`[-] Résumé IA ignoré pour ${item.id}:`, sumErr?.message || sumErr);
+            }
+          }
+
           const meta: MailTriageMeta = {
-            aiSummary: aiScheduleActions?.[0]?.summary || cleanSnippet || String(item.subject || "").slice(0, 140),
+            ...(aiSummary ? { aiSummary } : {}),
             aiPriority: decision.priority,
             aiCategory: decision.category,
             aiActionRequired: decision.actionRequired,
+            aiShouldNotify: shouldNotify,
+            ...(aiNotifText ? { aiNotifText } : {}),
             aiTags: [decision.category],
             triagedAt: new Date().toISOString(),
+            summaryVersion: 3,
             scheduleProcessed,
             ...(aiScheduleActions ? { aiScheduleActions } : {}),
           };
@@ -573,17 +781,20 @@ export class MailService {
         // 2. Fallback LLM standard si gemini-decision-1 n'est pas disponible
         const prompt = `Analyse ce courriel universitaire et réponds STRICTEMENT en JSON valide (aucun texte autour) :
 {
-  "aiSummary": "Résumé très concis en 1 phrase (max 140 caractères)",
+  "aiSummary": "Vrai résumé synthétique et reformulé en 1 phrase claire en français (max 140 caractères). Laisse une chaîne vide \"\" si le mail est très court ou trivial (1-2 phrases qui se lisent immédiatement). INTERDICTION de recopier le début du mail, les formules de politesse (Bonjour, Bonne journée) ou la signature.",
   "aiPriority": "low | normal | high | urgent",
   "aiCategory": "Action requise | Planning | Cours | Notes | Administratif | Information",
   "aiActionRequired": true ou false,
-  "aiTags": ["tag1", "tag2"]
+  "aiShouldNotify": true ou false,
+  "aiNotifText": "Texte ultra-concis (max 85 caractères, actionnable) si aiShouldNotify=true, sinon \"\"",
+  "aiTags": ["tag1", "tag2"],
+  "needsScheduleCheck": true ou false
 }
 
-De : ${item.from || ""}
+De : ${item.senderName ? `${item.senderName} <${item.from || ""}>` : (item.from || "")}
 Objet : ${item.subject || ""}
 Contenu :
-${bodyText.slice(0, 2000)}`;
+${cleanedBodyForLLM}`;
 
         const triageAiConfig = aiService.resolveConfigForRole(aiConfig, "mail_triage");
         const tempConfig: AIUserConfig = { ...triageAiConfig, enableTools: false };
@@ -598,10 +809,10 @@ ${bodyText.slice(0, 2000)}`;
         const match = cleaned.match(/\{[\s\S]*\}/);
         if (match) {
           const parsed = JSON.parse(match[0]);
-          let aiScheduleActions: MailTriageMeta["aiScheduleActions"] = undefined;
-          let scheduleProcessed = false;
+          let aiScheduleActions: MailTriageMeta["aiScheduleActions"] = existingActions;
+          let scheduleProcessed = alreadyScheduleProcessed;
 
-          if (shouldCheckSchedule && isRecent) {
+          if (shouldCheckSchedule && isRecent && !alreadyScheduleProcessed && (parsed.needsScheduleCheck || hasScheduleKeyword)) {
             try {
               const schedRes = await aiService.processMailForSchedule(
                 aiService.resolveConfigForRole(aiConfig, "schedule_agent"),
@@ -611,10 +822,11 @@ ${bodyText.slice(0, 2000)}`;
                   from: item.from || "",
                   senderName: item.senderName || authorizedSender?.name,
                   date: item.date || new Date().toISOString(),
-                  bodyText,
+                  bodyText: rawBodyText,
                   resourceCode: item.resourceCode,
                 },
-                currentDb
+                currentDb,
+                studentCtx
               );
               scheduleProcessed = true;
               if (schedRes.actions.length > 0) {
@@ -625,15 +837,25 @@ ${bodyText.slice(0, 2000)}`;
             }
           }
 
+          const trimmedSummary = typeof parsed.aiSummary === "string" ? parsed.aiSummary.trim().slice(0, 180) : "";
+          const trimmedNotifText = typeof parsed.aiNotifText === "string" ? parsed.aiNotifText.replace(/\s+/g, " ").trim().slice(0, 100) : "";
+          const shouldNotify = Boolean(
+            parsed.aiShouldNotify ||
+            parsed.aiPriority === "urgent" ||
+            (aiScheduleActions && aiScheduleActions.length > 0)
+          );
           const meta: MailTriageMeta = {
-            aiSummary: String(parsed.aiSummary || item.subject || "").slice(0, 180),
+            ...(trimmedSummary ? { aiSummary: trimmedSummary } : {}),
             aiPriority: ["low", "normal", "high", "urgent"].includes(parsed.aiPriority)
               ? parsed.aiPriority
               : "normal",
             aiCategory: String(parsed.aiCategory || "Information"),
             aiActionRequired: Boolean(parsed.aiActionRequired),
+            aiShouldNotify: shouldNotify,
+            ...(shouldNotify && trimmedNotifText ? { aiNotifText: trimmedNotifText } : {}),
             aiTags: Array.isArray(parsed.aiTags) ? parsed.aiTags.slice(0, 3).map(String) : [],
             triagedAt: new Date().toISOString(),
+            summaryVersion: 3,
             scheduleProcessed,
             ...(aiScheduleActions ? { aiScheduleActions } : {}),
           };
@@ -642,7 +864,7 @@ ${bodyText.slice(0, 2000)}`;
         }
       } catch (e: any) {
         console.warn(`[-] Triage IA ignoré pour message ${item.id}:`, e?.message || e);
-        if (shouldCheckSchedule && isRecent) {
+        if (shouldCheckSchedule && isRecent && !alreadyScheduleProcessed) {
           try {
             const schedRes = await aiService.processMailForSchedule(
               aiService.resolveConfigForRole(aiConfig, "schedule_agent"),
@@ -652,7 +874,7 @@ ${bodyText.slice(0, 2000)}`;
                 from: item.from || "",
                 senderName: item.senderName || authorizedSender?.name,
                 date: item.date || new Date().toISOString(),
-                bodyText,
+                bodyText: rawBodyText,
                 resourceCode: item.resourceCode,
               },
               currentDb,
@@ -660,12 +882,14 @@ ${bodyText.slice(0, 2000)}`;
             );
             if (schedRes.actions.length > 0) {
               const meta: MailTriageMeta = {
-                aiSummary: String(item.subject || schedRes.actions[0].summary).slice(0, 180),
                 aiPriority: "high",
                 aiCategory: "Planning",
                 aiActionRequired: false,
+                aiShouldNotify: true,
+                ...(schedRes.actions[0]?.summary ? { aiNotifText: schedRes.actions[0].summary.slice(0, 100) } : {}),
                 aiTags: ["Visio", "EDT"],
                 triagedAt: new Date().toISOString(),
+                summaryVersion: 3,
                 scheduleProcessed: true,
                 aiScheduleActions: schedRes.actions,
               };

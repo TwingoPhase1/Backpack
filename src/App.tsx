@@ -62,12 +62,14 @@ function MainContent() {
     grades: Set<string>;
     schedule: Set<string>;
     assignments: Set<string>;
+    mails: Set<string>;
     mailUnread: number;
   }>({
     initialized: false,
     grades: new Set(),
     schedule: new Set(),
     assignments: new Set(),
+    mails: new Set(),
     mailUnread: 0,
   });
 
@@ -141,6 +143,7 @@ function MainContent() {
         grades: new Set((recentData?.recentGrades || []).map((g) => g.id)),
         schedule: new Set((changesData?.changes || []).map((c) => c.id)),
         assignments: initialAssignments,
+        mails: new Set(),
         mailUnread,
       };
       if (resList.length > 0 && (!selectedResourceId || !resList.some((r) => r.id === selectedResourceId))) {
@@ -213,29 +216,97 @@ function MainContent() {
           }
         }
 
-        // 3. Nouveaux mails
+        // 3. Nouveaux mails (filtrage & résumé concis via gemini-decision-1 + IA)
         if (typeof mailUnread === "number") {
           setUnreadMailCount(mailUnread);
           if (mailUnread > seenStateRef.current.mailUnread) {
             const diff = mailUnread - seenStateRef.current.mailUnread;
-            let title = diff > 1 ? `${diff} nouveaux mails reçus` : "Nouveau mail reçu";
-            let body = "Consultez votre messagerie Unicaen.";
+            let notifiedCount = 0;
             try {
-              const inbox = await api.getMailMessages(3, 0, true, "INBOX");
-              const latestUnread = inbox.messages.find((m) => m.isUnread) || inbox.messages[0];
-              if (latestUnread) {
-                title = `Mail de ${latestUnread.from}`;
-                body = latestUnread.subject || "(Sans objet)";
+              const inbox = await api.getMailMessages(Math.min(6, Math.max(3, diff + 1)), 0, true, "INBOX");
+              const candidateMails = inbox.messages
+                .filter((m) => m.isUnread && !seenStateRef.current.mails.has(String(m.id)))
+                .slice(0, Math.min(diff, 3));
+
+              for (const m of candidateMails) {
+                seenStateRef.current.mails.add(String(m.id));
+              }
+
+              const needTriage = candidateMails.filter(
+                (m) => !m.aiTriaged || typeof m.aiShouldNotify !== "boolean"
+              );
+              let triagedMap: Record<string, any> = {};
+              if (needTriage.length > 0) {
+                try {
+                  const res = await api.triageMail(
+                    needTriage.map((m) => ({
+                      id: m.id,
+                      messageId: m.messageId,
+                      subject: m.subject,
+                      from: m.from,
+                      date: m.date,
+                    })),
+                    "INBOX"
+                  );
+                  if (res?.triaged) {
+                    triagedMap = res.triaged;
+                  }
+                } catch {
+                  // Si le triage échoue ou l'IA est désactivée, on notifie normalement
+                }
+              }
+
+              const priorityBadges: Record<string, string> = {
+                urgent: "🚨 URGENT",
+                high: "⚠️ IMPORTANT",
+                normal: "📌 INFO",
+                low: "ℹ️",
+              };
+
+              for (const rawMsg of candidateMails) {
+                const meta = triagedMap[rawMsg.id];
+                const msg = meta
+                  ? {
+                      ...rawMsg,
+                      aiTriaged: true,
+                      aiPriority: meta.aiPriority ?? rawMsg.aiPriority,
+                      aiCategory: meta.aiCategory ?? rawMsg.aiCategory,
+                      aiSummary: meta.aiSummary ?? rawMsg.aiSummary,
+                      aiShouldNotify: meta.aiShouldNotify ?? rawMsg.aiShouldNotify,
+                      aiNotifText: meta.aiNotifText ?? rawMsg.aiNotifText,
+                    }
+                  : rawMsg;
+
+                if (msg.aiTriaged && msg.aiShouldNotify === false) {
+                  continue;
+                }
+
+                const badge = (msg.aiPriority && priorityBadges[msg.aiPriority]) || "✉️";
+                const senderLabel = msg.senderName || msg.from || "Mail";
+                const notifBody = msg.aiNotifText || msg.aiSummary || msg.subject || "(Sans objet)";
+
+                pushNotification({
+                  id: `mail-${msg.id}`,
+                  category: "mail",
+                  title: `${badge} · ${senderLabel}`,
+                  body: notifBody,
+                  onClick: () => {
+                    setPreferredMailId(msg.id);
+                    setActiveView("mail");
+                  },
+                });
+                notifiedCount++;
               }
             } catch {
-              // Garder le message générique si la lecture du détail échoue
+              if (notifiedCount === 0) {
+                pushNotification({
+                  category: "mail",
+                  title: diff > 1 ? `${diff} nouveaux mails reçus` : "Nouveau mail reçu",
+                  body: "Consultez votre messagerie Unicaen.",
+                  onClick: () => setActiveView("mail"),
+                });
+              }
             }
-            pushNotification({
-              category: "mail",
-              title,
-              body,
-              onClick: () => setActiveView("mail"),
-            });
           }
           seenStateRef.current.mailUnread = mailUnread;
         }

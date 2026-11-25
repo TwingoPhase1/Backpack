@@ -268,9 +268,12 @@ export interface MailMessage {
   references?: string;
   threadKey?: string;
   aiSummary?: string;
+  aiTriaged?: boolean;
   aiPriority?: "low" | "normal" | "high" | "urgent";
   aiCategory?: string;
   aiActionRequired?: boolean;
+  aiShouldNotify?: boolean;
+  aiNotifText?: string;
   aiTags?: string[];
   aiScheduleActions?: Array<{ action: string; summary: string; eventId?: string; visioUrl?: string }>;
 }

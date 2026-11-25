@@ -26,10 +26,11 @@ import {
   findBestMoodleCourseForResource,
   findMoodleCoursesForResource,
 } from "./services/moodleMatcher.js";
+import { sqlite, withTransaction, deleteAllUserSqliteData, DATA_DIR as SQLITE_DATA_DIR } from "./sqlite.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.resolve(__dirname, "../data");
+const DATA_DIR = SQLITE_DATA_DIR;
 const UPLOADS_DIR = path.resolve(DATA_DIR, "uploads");
 const DB_FILE = path.resolve(DATA_DIR, "database.json");
 
@@ -316,15 +317,102 @@ function getInitialScheduleChanges(events: ScheduleEvent[]): ScheduleChangeNotif
   return changes;
 }
 
+// Statements SQLite préparés pour des lectures/écritures incrémentales rapides
+const stmtHasUserMeta = sqlite.prepare("SELECT 1 AS ok FROM user_meta WHERE username = ?");
+const stmtUpsertUserMeta = sqlite.prepare(
+  "INSERT OR REPLACE INTO user_meta (username, initialized, updated_at) VALUES (?, 1, ?)"
+);
+const stmtSelectKv = sqlite.prepare("SELECT key, value FROM user_kv WHERE username = ?");
+const stmtUpsertKv = sqlite.prepare(
+  "INSERT OR REPLACE INTO user_kv (username, key, value, updated_at) VALUES (?, ?, ?, ?)"
+);
+
+const stmtSelectResources = sqlite.prepare("SELECT data FROM resources WHERE username = ? ORDER BY sort_order ASC");
+const stmtUpsertResource = sqlite.prepare(
+  "INSERT OR REPLACE INTO resources (username, id, code, semester, category, sort_order, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
+);
+const stmtDeleteResource = sqlite.prepare("DELETE FROM resources WHERE username = ? AND id = ?");
+const stmtClearResources = sqlite.prepare("DELETE FROM resources WHERE username = ?");
+
+const stmtSelectNotes = sqlite.prepare("SELECT data FROM notes WHERE username = ?");
+const stmtUpsertNote = sqlite.prepare(
+  "INSERT OR REPLACE INTO notes (username, id, resource_id, type, title, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+);
+const stmtDeleteNote = sqlite.prepare("DELETE FROM notes WHERE username = ? AND id = ?");
+const stmtDeleteAssetsByNote = sqlite.prepare("DELETE FROM assets WHERE username = ? AND note_id = ?");
+const stmtClearNotes = sqlite.prepare("DELETE FROM notes WHERE username = ?");
+
+const stmtSelectAssets = sqlite.prepare("SELECT data FROM assets WHERE username = ?");
+const stmtUpsertAsset = sqlite.prepare(
+  "INSERT OR REPLACE INTO assets (username, id, note_id, file_name, data) VALUES (?, ?, ?, ?, ?)"
+);
+const stmtDeleteAsset = sqlite.prepare("DELETE FROM assets WHERE username = ? AND id = ?");
+const stmtClearAssets = sqlite.prepare("DELETE FROM assets WHERE username = ?");
+
+const stmtSelectScheduleEvents = sqlite.prepare("SELECT data FROM schedule_events WHERE username = ? ORDER BY start_at ASC");
+const stmtUpsertScheduleEvent = sqlite.prepare(
+  "INSERT OR REPLACE INTO schedule_events (username, id, start_at, end_at, matched_code, data) VALUES (?, ?, ?, ?, ?, ?)"
+);
+const stmtClearScheduleEvents = sqlite.prepare("DELETE FROM schedule_events WHERE username = ?");
+
+const stmtSelectRecentGrades = sqlite.prepare("SELECT data FROM recent_grades WHERE username = ? ORDER BY sort_order ASC");
+const stmtUpsertRecentGrade = sqlite.prepare(
+  "INSERT OR REPLACE INTO recent_grades (username, id, resource_code, is_read, detected_at, sort_order, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
+);
+const stmtClearRecentGrades = sqlite.prepare("DELETE FROM recent_grades WHERE username = ?");
+
+const stmtSelectScheduleChanges = sqlite.prepare("SELECT data FROM schedule_changes WHERE username = ? ORDER BY sort_order ASC");
+const stmtUpsertScheduleChange = sqlite.prepare(
+  "INSERT OR REPLACE INTO schedule_changes (username, id, event_id, is_read, detected_at, sort_order, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
+);
+const stmtClearScheduleChanges = sqlite.prepare("DELETE FROM schedule_changes WHERE username = ?");
+
+const stmtSelectStickyNotes = sqlite.prepare("SELECT data FROM sticky_notes WHERE username = ?");
+const stmtUpsertStickyNote = sqlite.prepare(
+  "INSERT OR REPLACE INTO sticky_notes (username, id, resource_code, is_pinned, updated_at, data) VALUES (?, ?, ?, ?, ?, ?)"
+);
+const stmtDeleteStickyNote = sqlite.prepare("DELETE FROM sticky_notes WHERE username = ? AND id = ?");
+const stmtClearStickyNotes = sqlite.prepare("DELETE FROM sticky_notes WHERE username = ?");
+
+const stmtSelectLessons = sqlite.prepare("SELECT data FROM lessons WHERE username = ?");
+const stmtUpsertLesson = sqlite.prepare(
+  "INSERT OR REPLACE INTO lessons (username, id, resource_code, due_date, is_completed, updated_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
+);
+const stmtDeleteLesson = sqlite.prepare("DELETE FROM lessons WHERE username = ? AND id = ?");
+const stmtClearLessons = sqlite.prepare("DELETE FROM lessons WHERE username = ?");
+
+const stmtSelectSlides = sqlite.prepare("SELECT data FROM slides WHERE username = ?");
+const stmtUpsertSlide = sqlite.prepare(
+  "INSERT OR REPLACE INTO slides (username, id, resource_code, updated_at, data) VALUES (?, ?, ?, ?, ?)"
+);
+const stmtDeleteSlide = sqlite.prepare("DELETE FROM slides WHERE username = ? AND id = ?");
+const stmtClearSlides = sqlite.prepare("DELETE FROM slides WHERE username = ?");
+
+const stmtSelectQcms = sqlite.prepare("SELECT data FROM qcms WHERE username = ?");
+const stmtUpsertQcm = sqlite.prepare(
+  "INSERT OR REPLACE INTO qcms (username, id, resource_code, updated_at, data) VALUES (?, ?, ?, ?, ?)"
+);
+const stmtDeleteQcm = sqlite.prepare("DELETE FROM qcms WHERE username = ? AND id = ?");
+const stmtClearQcms = sqlite.prepare("DELETE FROM qcms WHERE username = ?");
+
+const stmtSelectAuthorizedSenders = sqlite.prepare("SELECT email, name, role, added_at FROM authorized_senders WHERE username = ?");
+const stmtUpsertAuthorizedSender = sqlite.prepare(
+  "INSERT OR REPLACE INTO authorized_senders (username, email, name, role, added_at) VALUES (?, ?, ?, ?, ?)"
+);
+const stmtDeleteAuthorizedSender = sqlite.prepare("DELETE FROM authorized_senders WHERE username = ? AND email = ?");
+const stmtClearAuthorizedSenders = sqlite.prepare("DELETE FROM authorized_senders WHERE username = ?");
+
 class Database {
   private data: DatabaseSchema;
   public userDir?: string;
+  public usernameKey: string;
   public dbFile: string;
   public uploadsDir: string;
   public moodleFile: string;
 
-  constructor(userDir?: string) {
+  constructor(userDir?: string, usernameKey?: string) {
     this.userDir = userDir;
+    this.usernameKey = (usernameKey || (userDir ? path.basename(userDir) : "_default")).toLowerCase().trim();
     this.dbFile = userDir ? path.resolve(userDir, "database.json") : DB_FILE;
     this.uploadsDir = userDir ? path.resolve(userDir, "uploads") : UPLOADS_DIR;
     this.moodleFile = userDir
@@ -347,59 +435,135 @@ class Database {
     this.data = this.load();
   }
 
+  private normalizeParsedData(parsed: DatabaseSchema): boolean {
+    let changed = false;
+    if (!parsed.grades || parsed.grades.length === 0) {
+      parsed.grades = getDefaultLastYearGrades();
+      changed = true;
+    }
+    if (!parsed.recentGrades || parsed.recentGrades.length === 0) {
+      parsed.recentGrades = extractTopRecentEvaluations(parsed.grades);
+      changed = true;
+    }
+    if (!parsed.scheduleChanges || parsed.scheduleChanges.length === 0) {
+      parsed.scheduleChanges = getInitialScheduleChanges(parsed.scheduleEvents || []);
+      changed = true;
+    }
+    if (!parsed.syncStatus) {
+      parsed.syncStatus = {
+        lastSyncTime: new Date().toISOString(),
+        nextScheduledSync: null,
+        lastSyncResult: "success",
+        lastSyncMessage: "Relevé initialisé",
+        unreadCount: (parsed.recentGrades || []).filter((g: any) => !g.isRead).length,
+      };
+      changed = true;
+    }
+    if (!parsed.stickyNotes) {
+      parsed.stickyNotes = [];
+      changed = true;
+    }
+    if (!parsed.lessons) {
+      parsed.lessons = [];
+      changed = true;
+    }
+    if (!parsed.slides) {
+      parsed.slides = [];
+      changed = true;
+    }
+    if (!parsed.qcms) {
+      parsed.qcms = [];
+      changed = true;
+    }
+    return changed;
+  }
+
+  private loadFromSqlite(): DatabaseSchema {
+    const parseRows = <T>(rows: Array<{ data?: unknown }>): T[] => {
+      const out: T[] = [];
+      for (const r of rows) {
+        if (typeof r.data === "string") {
+          try {
+            out.push(JSON.parse(r.data));
+          } catch {}
+        }
+      }
+      return out;
+    };
+
+    const kvRows = stmtSelectKv.all(this.usernameKey) as Array<{ key: string; value: string }>;
+    const kv = new Map<string, any>();
+    for (const row of kvRows) {
+      try {
+        kv.set(row.key, JSON.parse(row.value));
+      } catch {}
+    }
+
+    const senderRows = stmtSelectAuthorizedSenders.all(this.usernameKey) as Array<{
+      email: string;
+      name?: string;
+      role: "teacher" | "staff";
+      added_at?: string;
+    }>;
+
+    const schema: DatabaseSchema = {
+      resources: parseRows<Resource>(stmtSelectResources.all(this.usernameKey) as any),
+      notes: parseRows<Note>(stmtSelectNotes.all(this.usernameKey) as any),
+      assets: parseRows<Asset>(stmtSelectAssets.all(this.usernameKey) as any),
+      scheduleEvents: parseRows<ScheduleEvent>(stmtSelectScheduleEvents.all(this.usernameKey) as any),
+      grades: kv.get("grades") || [],
+      recentGrades: parseRows<DetectedNewGrade>(stmtSelectRecentGrades.all(this.usernameKey) as any),
+      scheduleChanges: parseRows<ScheduleChangeNotification>(stmtSelectScheduleChanges.all(this.usernameKey) as any),
+      syncStatus: kv.get("sync_status"),
+      moodleCourses: kv.get("moodle_courses"),
+      moodleSyncStatus: kv.get("moodle_sync_status"),
+      stickyNotes: parseRows<StickyNote>(stmtSelectStickyNotes.all(this.usernameKey) as any),
+      lessons: parseRows<LessonItem>(stmtSelectLessons.all(this.usernameKey) as any),
+      aiConfig: kv.get("ai_config"),
+      slides: parseRows<SlideDeckItem>(stmtSelectSlides.all(this.usernameKey) as any),
+      qcms: parseRows<QCMQuiz>(stmtSelectQcms.all(this.usernameKey) as any),
+      authorizedSenders: senderRows.map((s) => ({
+        email: s.email,
+        name: s.name || s.email,
+        role: s.role,
+        addedAt: s.added_at || new Date().toISOString(),
+      })),
+    };
+
+    if (schema.resources.length === 0) {
+      schema.resources = getInitialResources();
+      this.replaceResourcesRows(schema.resources);
+    }
+
+    const changed = this.normalizeParsedData(schema);
+    if (changed) {
+      this.saveData(schema);
+    }
+    return schema;
+  }
+
   private load(): DatabaseSchema {
+    // 1. Si déjà présent dans SQLite, charger directement depuis les tables SQLite
+    const hasRow = stmtHasUserMeta.get(this.usernameKey) as { ok?: number } | undefined;
+    if (hasRow?.ok) {
+      return this.loadFromSqlite();
+    }
+
+    // 2. Sinon, migrer automatiquement l'ancien fichier database.json s'il existe
     if (fs.existsSync(this.dbFile)) {
       try {
         const raw = fs.readFileSync(this.dbFile, "utf-8");
-        const parsed = JSON.parse(raw);
-        let changed = false;
-        if (!parsed.grades || parsed.grades.length === 0) {
-          parsed.grades = getDefaultLastYearGrades();
-          changed = true;
-        }
-        if (!parsed.recentGrades || parsed.recentGrades.length === 0) {
-          parsed.recentGrades = extractTopRecentEvaluations(parsed.grades);
-          changed = true;
-        }
-        if (!parsed.scheduleChanges || parsed.scheduleChanges.length === 0) {
-          parsed.scheduleChanges = getInitialScheduleChanges(parsed.scheduleEvents || []);
-          changed = true;
-        }
-        if (!parsed.syncStatus) {
-          parsed.syncStatus = {
-            lastSyncTime: new Date().toISOString(),
-            nextScheduledSync: null,
-            lastSyncResult: "success",
-            lastSyncMessage: "Relevé initialisé",
-            unreadCount: (parsed.recentGrades || []).filter((g: any) => !g.isRead).length,
-          };
-          changed = true;
-        }
-        if (!parsed.stickyNotes) {
-          parsed.stickyNotes = [];
-          changed = true;
-        }
-        if (!parsed.lessons) {
-          parsed.lessons = [];
-          changed = true;
-        }
-        if (!parsed.slides) {
-          parsed.slides = [];
-          changed = true;
-        }
-        if (!parsed.qcms) {
-          parsed.qcms = [];
-          changed = true;
-        }
-        if (changed) {
-          this.saveData(parsed);
-        }
+        const parsed = JSON.parse(raw) as DatabaseSchema;
+        this.normalizeParsedData(parsed);
+        this.saveData(parsed);
+        console.log(`[+] Migration SQLite réussie pour "${this.usernameKey}" depuis ${this.dbFile}`);
         return parsed;
       } catch (e) {
-        console.error(`Error reading ${this.dbFile}, re-initializing`, e);
+        console.error(`Error migrating ${this.dbFile} to SQLite, re-initializing`, e);
       }
     }
 
+    // 3. Initialisation à neuf
     const grades = getDefaultLastYearGrades();
     const recentGrades = extractTopRecentEvaluations(grades);
     const scheduleEvents = getInitialScheduleEvents();
@@ -428,8 +592,206 @@ class Database {
     return initialData;
   }
 
+  // --- Helpers SQLite incrémentaux ---
+  private setKv(key: string, value: unknown) {
+    if (value === undefined) return;
+    stmtUpsertKv.run(this.usernameKey, key, JSON.stringify(value), new Date().toISOString());
+  }
+
+  private upsertResourceRow(res: Resource, sortOrder = 0) {
+    stmtUpsertResource.run(
+      this.usernameKey,
+      res.id,
+      res.code,
+      res.semester ?? null,
+      res.category ?? null,
+      sortOrder,
+      JSON.stringify(res)
+    );
+  }
+
+  private replaceResourcesRows(resources: Resource[]) {
+    withTransaction(() => {
+      stmtClearResources.run(this.usernameKey);
+      resources.forEach((r, idx) => this.upsertResourceRow(r, idx));
+    });
+  }
+
+  private upsertNoteRow(note: Note) {
+    stmtUpsertNote.run(
+      this.usernameKey,
+      note.id,
+      note.resourceId,
+      note.type,
+      note.title,
+      note.createdAt || null,
+      note.updatedAt || null,
+      JSON.stringify(note)
+    );
+  }
+
+  private upsertAssetRow(asset: Asset) {
+    stmtUpsertAsset.run(
+      this.usernameKey,
+      asset.id,
+      asset.noteId ?? null,
+      asset.fileName ?? null,
+      JSON.stringify(asset)
+    );
+  }
+
+  private upsertScheduleEventRow(ev: ScheduleEvent) {
+    stmtUpsertScheduleEvent.run(
+      this.usernameKey,
+      ev.id,
+      ev.start,
+      ev.end,
+      ev.matchedCode ?? null,
+      JSON.stringify(ev)
+    );
+  }
+
+  private replaceScheduleEventsRows(events: ScheduleEvent[]) {
+    withTransaction(() => {
+      stmtClearScheduleEvents.run(this.usernameKey);
+      for (const ev of events) {
+        this.upsertScheduleEventRow(ev);
+      }
+    });
+  }
+
+  private replaceScheduleChangesRows(changes: ScheduleChangeNotification[]) {
+    withTransaction(() => {
+      stmtClearScheduleChanges.run(this.usernameKey);
+      changes.forEach((c, idx) => {
+        stmtUpsertScheduleChange.run(
+          this.usernameKey,
+          c.id,
+          c.eventId ?? null,
+          c.isRead ? 1 : 0,
+          c.detectedAt ?? null,
+          idx,
+          JSON.stringify(c)
+        );
+      });
+    });
+  }
+
+  private replaceRecentGradesRows(recentGrades: DetectedNewGrade[]) {
+    withTransaction(() => {
+      stmtClearRecentGrades.run(this.usernameKey);
+      recentGrades.forEach((g, idx) => {
+        stmtUpsertRecentGrade.run(
+          this.usernameKey,
+          String(g.id),
+          g.resourceCode,
+          g.isRead ? 1 : 0,
+          g.detectedAt ?? null,
+          idx,
+          JSON.stringify(g)
+        );
+      });
+    });
+  }
+
+  private upsertStickyNoteRow(note: StickyNote) {
+    stmtUpsertStickyNote.run(
+      this.usernameKey,
+      note.id,
+      note.resourceCode ?? null,
+      note.isPinned ? 1 : 0,
+      note.updatedAt ?? null,
+      JSON.stringify(note)
+    );
+  }
+
+  private upsertLessonRow(lesson: LessonItem) {
+    stmtUpsertLesson.run(
+      this.usernameKey,
+      lesson.id,
+      lesson.resourceCode,
+      lesson.dueDate ?? null,
+      lesson.isCompleted ? 1 : 0,
+      lesson.updatedAt ?? null,
+      JSON.stringify(lesson)
+    );
+  }
+
+  private upsertSlideRow(slide: SlideDeckItem) {
+    stmtUpsertSlide.run(
+      this.usernameKey,
+      slide.id,
+      slide.resourceCode ?? null,
+      slide.updatedAt ?? null,
+      JSON.stringify(slide)
+    );
+  }
+
+  private upsertQcmRow(qcm: QCMQuiz) {
+    stmtUpsertQcm.run(
+      this.usernameKey,
+      qcm.id,
+      qcm.resourceCode,
+      qcm.updatedAt ?? null,
+      JSON.stringify(qcm)
+    );
+  }
+
+  private replaceAuthorizedSendersRows(senders: AuthorizedSender[]) {
+    withTransaction(() => {
+      stmtClearAuthorizedSenders.run(this.usernameKey);
+      for (const s of senders) {
+        stmtUpsertAuthorizedSender.run(
+          this.usernameKey,
+          s.email.toLowerCase(),
+          s.name ?? null,
+          s.role,
+          s.addedAt ?? null
+        );
+      }
+    });
+  }
+
   private saveData(data: DatabaseSchema) {
-    fs.writeFileSync(this.dbFile, JSON.stringify(data, null, 2), "utf-8");
+    const now = new Date().toISOString();
+    withTransaction(() => {
+      stmtUpsertUserMeta.run(this.usernameKey, now);
+
+      stmtClearResources.run(this.usernameKey);
+      (data.resources || []).forEach((r, idx) => this.upsertResourceRow(r, idx));
+
+      stmtClearNotes.run(this.usernameKey);
+      for (const n of data.notes || []) this.upsertNoteRow(n);
+
+      stmtClearAssets.run(this.usernameKey);
+      for (const a of data.assets || []) this.upsertAssetRow(a);
+
+      stmtClearScheduleEvents.run(this.usernameKey);
+      for (const ev of data.scheduleEvents || []) this.upsertScheduleEventRow(ev);
+
+      this.replaceRecentGradesRows(data.recentGrades || []);
+      this.replaceScheduleChangesRows(data.scheduleChanges || []);
+
+      stmtClearStickyNotes.run(this.usernameKey);
+      for (const sn of data.stickyNotes || []) this.upsertStickyNoteRow(sn);
+
+      stmtClearLessons.run(this.usernameKey);
+      for (const l of data.lessons || []) this.upsertLessonRow(l);
+
+      stmtClearSlides.run(this.usernameKey);
+      for (const sl of data.slides || []) this.upsertSlideRow(sl);
+
+      stmtClearQcms.run(this.usernameKey);
+      for (const q of data.qcms || []) this.upsertQcmRow(q);
+
+      this.replaceAuthorizedSendersRows(data.authorizedSenders || []);
+
+      if (data.grades !== undefined) this.setKv("grades", data.grades);
+      if (data.syncStatus !== undefined) this.setKv("sync_status", data.syncStatus);
+      if (data.moodleCourses !== undefined) this.setKv("moodle_courses", data.moodleCourses);
+      if (data.moodleSyncStatus !== undefined) this.setKv("moodle_sync_status", data.moodleSyncStatus);
+      if (data.aiConfig !== undefined) this.setKv("ai_config", data.aiConfig);
+    });
   }
 
   public save() {
@@ -564,7 +926,7 @@ class Database {
 
   public createResource(res: Resource): Resource {
     this.data.resources.push(res);
-    this.save();
+    this.upsertResourceRow(res, this.data.resources.length - 1);
     return res;
   }
 
@@ -572,7 +934,7 @@ class Database {
     const idx = this.data.resources.findIndex((r) => r.id === id);
     if (idx === -1) return undefined;
     this.data.resources[idx] = { ...this.data.resources[idx], ...update };
-    this.save();
+    this.upsertResourceRow(this.data.resources[idx], idx);
     return this.data.resources[idx];
   }
 
@@ -580,7 +942,7 @@ class Database {
     const prevLen = this.data.resources.length;
     this.data.resources = this.data.resources.filter((r) => r.id !== id);
     if (this.data.resources.length !== prevLen) {
-      this.save();
+      stmtDeleteResource.run(this.usernameKey, id);
       return true;
     }
     return false;
@@ -610,7 +972,7 @@ class Database {
       note.updatedAt = new Date().toISOString();
     }
     this.data.notes.push(note);
-    this.save();
+    this.upsertNoteRow(note);
     return note;
   }
 
@@ -622,7 +984,7 @@ class Database {
       ...update,
       updatedAt: new Date().toISOString(),
     };
-    this.save();
+    this.upsertNoteRow(this.data.notes[idx]);
     return this.data.notes[idx];
   }
 
@@ -631,7 +993,10 @@ class Database {
     this.data.notes = this.data.notes.filter((n) => n.id !== id);
     this.data.assets = this.data.assets.filter((a) => a.noteId !== id);
     if (this.data.notes.length !== prevLen) {
-      this.save();
+      withTransaction(() => {
+        stmtDeleteNote.run(this.usernameKey, id);
+        stmtDeleteAssetsByNote.run(this.usernameKey, id);
+      });
       return true;
     }
     return false;
@@ -648,7 +1013,7 @@ class Database {
 
   public createAsset(asset: Asset): Asset {
     this.data.assets.push(asset);
-    this.save();
+    this.upsertAssetRow(asset);
     return asset;
   }
 
@@ -661,23 +1026,29 @@ class Database {
       id: this.data.assets[idx].id,
       fileName: this.data.assets[idx].fileName,
     };
-    this.save();
+    this.upsertAssetRow(this.data.assets[idx]);
     return this.data.assets[idx];
   }
 
   public deleteAsset(id: string): boolean {
     const asset = this.getAssetById(id);
     if (!asset) return false;
-    const filePath = path.resolve(UPLOADS_DIR, asset.fileName);
-    if (fs.existsSync(filePath)) {
-      try {
-        fs.unlinkSync(filePath);
-      } catch (e) {
-        console.error("Error unlinking asset file", e);
+    const candidatePaths = [
+      path.resolve(this.uploadsDir, asset.fileName),
+      path.resolve(UPLOADS_DIR, asset.fileName),
+    ];
+    for (const filePath of candidatePaths) {
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {
+          console.error("Error unlinking asset file", e);
+        }
+        break;
       }
     }
     this.data.assets = this.data.assets.filter((a) => a.id !== id);
-    this.save();
+    stmtDeleteAsset.run(this.usernameKey, id);
     return true;
   }
 
@@ -777,7 +1148,12 @@ class Database {
       const existing = this.data.scheduleChanges || [];
       this.data.scheduleChanges = [...newChanges, ...existing].slice(0, 30);
     }
-    this.save();
+    withTransaction(() => {
+      this.replaceScheduleEventsRows(mergedEvents);
+      if (newChanges.length > 0) {
+        this.replaceScheduleChangesRows(this.data.scheduleChanges || []);
+      }
+    });
     return { changes: newChanges };
   }
 
@@ -818,7 +1194,7 @@ class Database {
       map.set(key, prev ? { ...prev, name: entry.name || prev.name } : { ...entry, email: key });
     }
     this.data.authorizedSenders = Array.from(map.values());
-    this.save();
+    this.replaceAuthorizedSendersRows(this.data.authorizedSenders);
     return this.data.authorizedSenders;
   }
 
@@ -833,7 +1209,13 @@ class Database {
     const list = this.getAuthorizedSenders().filter((s) => s.email.toLowerCase() !== normalized);
     list.push(entry);
     this.data.authorizedSenders = list;
-    this.save();
+    stmtUpsertAuthorizedSender.run(
+      this.usernameKey,
+      entry.email,
+      entry.name ?? null,
+      entry.role,
+      entry.addedAt
+    );
     return entry;
   }
 
@@ -843,7 +1225,7 @@ class Database {
     const after = before.filter((s) => s.email.toLowerCase() !== normalized);
     if (after.length === before.length) return false;
     this.data.authorizedSenders = after;
-    this.save();
+    stmtDeleteAuthorizedSender.run(this.usernameKey, normalized);
     return true;
   }
 
@@ -914,7 +1296,10 @@ class Database {
       isRead: false,
     };
     this.data.scheduleChanges = [notif, ...(this.data.scheduleChanges || [])].slice(0, 30);
-    this.save();
+    withTransaction(() => {
+      this.upsertScheduleEventRow(updated);
+      this.replaceScheduleChangesRows(this.data.scheduleChanges || []);
+    });
     return updated;
   }
 
@@ -939,7 +1324,10 @@ class Database {
       isRead: false,
     };
     this.data.scheduleChanges = [notif, ...(this.data.scheduleChanges || [])].slice(0, 30);
-    this.save();
+    withTransaction(() => {
+      this.upsertScheduleEventRow(created);
+      this.replaceScheduleChangesRows(this.data.scheduleChanges || []);
+    });
     return created;
   }
 
@@ -951,19 +1339,24 @@ class Database {
     } else {
       this.data.scheduleChanges.forEach((c) => (c.isRead = true));
     }
-    this.save();
+    this.replaceScheduleChangesRows(this.data.scheduleChanges);
   }
 
   // Grades / Webnotes
   public getGrades(): SemesterReport[] {
-    const gradesFile = path.resolve(DATA_DIR, "grades.json");
-    if (fs.existsSync(gradesFile)) {
-      try {
-        const raw = JSON.parse(fs.readFileSync(gradesFile, "utf-8"));
-        if (raw.semestres && Array.isArray(raw.semestres)) return raw.semestres;
-        if (Array.isArray(raw)) return raw;
-      } catch (e) {
-        console.error("Error reading grades.json", e);
+    if (this.data.grades && this.data.grades.length > 0) {
+      return this.data.grades;
+    }
+    if (!this.userDir) {
+      const gradesFile = path.resolve(DATA_DIR, "grades.json");
+      if (fs.existsSync(gradesFile)) {
+        try {
+          const raw = JSON.parse(fs.readFileSync(gradesFile, "utf-8"));
+          if (raw.semestres && Array.isArray(raw.semestres)) return raw.semestres;
+          if (Array.isArray(raw)) return raw;
+        } catch (e) {
+          console.error("Error reading grades.json", e);
+        }
       }
     }
     return this.data.grades || [];
@@ -1027,20 +1420,30 @@ class Database {
       this.data.recentGrades = merged.slice(0, 30);
     }
     this.data.syncStatus = {
-      ...(this.data.syncStatus || {}),
+      ...(this.data.syncStatus || {
+        nextScheduledSync: null,
+      }),
       lastSyncTime: new Date().toISOString(),
       lastSyncResult: "success",
       lastSyncMessage: `${reports.length} semestre(s) synchronisé(s) (${newlyDetected.length} nouvelle(s) note(s))`,
       unreadCount: (this.data.recentGrades || []).filter((g) => !g.isRead).length,
     };
-    this.save();
+    withTransaction(() => {
+      this.setKv("grades", this.data.grades);
+      if (newlyDetected.length > 0) {
+        this.replaceRecentGradesRows(this.data.recentGrades || []);
+      }
+      this.setKv("sync_status", this.data.syncStatus);
+    });
 
     // Also backup to data/grades.json for external scripts
-    const gradesFile = path.resolve(DATA_DIR, "grades.json");
-    try {
-      fs.writeFileSync(gradesFile, JSON.stringify({ semestres: reports }, null, 2), "utf-8");
-    } catch (e) {
-      console.error("Error writing grades.json", e);
+    if (!this.userDir) {
+      const gradesFile = path.resolve(DATA_DIR, "grades.json");
+      try {
+        fs.writeFileSync(gradesFile, JSON.stringify({ semestres: reports }, null, 2), "utf-8");
+      } catch (e) {
+        console.error("Error writing grades.json", e);
+      }
     }
 
     return { newlyDetected };
@@ -1061,7 +1464,12 @@ class Database {
     if (this.data.syncStatus) {
       this.data.syncStatus.unreadCount = this.data.recentGrades.filter((g) => !g.isRead).length;
     }
-    this.save();
+    withTransaction(() => {
+      this.replaceRecentGradesRows(this.data.recentGrades || []);
+      if (this.data.syncStatus) {
+        this.setKv("sync_status", this.data.syncStatus);
+      }
+    });
   }
 
   public getSyncStatus(): SyncStatus {
@@ -1087,7 +1495,7 @@ class Database {
       }),
       ...status,
     };
-    this.save();
+    this.setKv("sync_status", this.data.syncStatus);
   }
 
   public getGradesByResourceId(code: string): { semester: number; resourceGrade?: ResourceGrade }[] {
@@ -1161,7 +1569,7 @@ class Database {
 
   public updateMoodleCourses(courses: MoodleCourse[]) {
     this.data.moodleCourses = courses;
-    this.save();
+    this.setKv("moodle_courses", courses);
   }
 
   public getMoodleSyncStatus(): MoodleSyncStatus {
@@ -1193,7 +1601,7 @@ class Database {
       ...this.getMoodleSyncStatus(),
       ...status,
     };
-    this.save();
+    this.setKv("moodle_sync_status", this.data.moodleSyncStatus);
   }
 
   // --- Sticky Notes (Post-it) ---
@@ -1223,7 +1631,7 @@ class Database {
           updatedAt: now,
         };
         this.data.stickyNotes[idx] = updated;
-        this.save();
+        this.upsertStickyNoteRow(updated);
         return updated;
       }
     }
@@ -1239,7 +1647,7 @@ class Database {
       updatedAt: now,
     };
     this.data.stickyNotes.unshift(newNote);
-    this.save();
+    this.upsertStickyNoteRow(newNote);
     return newNote;
   }
 
@@ -1248,7 +1656,7 @@ class Database {
     const initialLen = this.data.stickyNotes.length;
     this.data.stickyNotes = this.data.stickyNotes.filter((n) => n.id !== id);
     if (this.data.stickyNotes.length !== initialLen) {
-      this.save();
+      stmtDeleteStickyNote.run(this.usernameKey, id);
       return true;
     }
     return false;
@@ -1281,7 +1689,7 @@ class Database {
           updatedAt: now,
         };
         this.data.lessons[idx] = updated;
-        this.save();
+        this.upsertLessonRow(updated);
         return updated;
       }
     }
@@ -1299,7 +1707,7 @@ class Database {
       updatedAt: now,
     };
     this.data.lessons.unshift(newLesson);
-    this.save();
+    this.upsertLessonRow(newLesson);
     return newLesson;
   }
 
@@ -1308,7 +1716,7 @@ class Database {
     const initialLen = this.data.lessons.length;
     this.data.lessons = this.data.lessons.filter((l) => l.id !== id);
     if (this.data.lessons.length !== initialLen) {
-      this.save();
+      stmtDeleteLesson.run(this.usernameKey, id);
       return true;
     }
     return false;
@@ -1320,7 +1728,7 @@ class Database {
     if (!item) return null;
     item.isCompleted = !item.isCompleted;
     item.updatedAt = new Date().toISOString();
-    this.save();
+    this.upsertLessonRow(item);
     return item;
   }
 
@@ -1340,10 +1748,10 @@ class Database {
         enableTools: true,
         enableProactive: true,
       };
-      this.save();
+      this.setKv("ai_config", this.data.aiConfig);
     } else if (!this.data.aiConfig.providers.google) {
       this.data.aiConfig.providers.google = { apiKey: "", model: "gemini-2.5-flash" };
-      this.save();
+      this.setKv("ai_config", this.data.aiConfig);
     }
     return this.data.aiConfig;
   }
@@ -1358,7 +1766,7 @@ class Database {
         ...(config.providers || {}),
       },
     };
-    this.save();
+    this.setKv("ai_config", this.data.aiConfig);
     return this.data.aiConfig;
   }
 
@@ -1382,7 +1790,7 @@ class Database {
         ...deck,
         updatedAt: new Date().toISOString(),
       };
-      this.save();
+      this.upsertSlideRow(slides[idx]);
       return slides[idx];
     } else {
       const newDeck: SlideDeckItem = {
@@ -1391,7 +1799,7 @@ class Database {
         updatedAt: new Date().toISOString(),
       };
       slides.push(newDeck);
-      this.save();
+      this.upsertSlideRow(newDeck);
       return newDeck;
     }
   }
@@ -1401,7 +1809,7 @@ class Database {
     const idx = slides.findIndex((s) => s.id === id);
     if (idx >= 0) {
       slides.splice(idx, 1);
-      this.save();
+      stmtDeleteSlide.run(this.usernameKey, id);
       return true;
     }
     return false;
@@ -1425,7 +1833,7 @@ class Database {
     if (!qcm.createdAt) qcm.createdAt = new Date().toISOString();
     if (!qcm.updatedAt) qcm.updatedAt = new Date().toISOString();
     this.data.qcms.unshift(qcm);
-    this.save();
+    this.upsertQcmRow(qcm);
     return qcm;
   }
 
@@ -1438,7 +1846,7 @@ class Database {
       ...update,
       updatedAt: new Date().toISOString(),
     };
-    this.save();
+    this.upsertQcmRow(this.data.qcms[idx]);
     return this.data.qcms[idx];
   }
 
@@ -1447,7 +1855,7 @@ class Database {
     const prev = this.data.qcms.length;
     this.data.qcms = this.data.qcms.filter((q) => q.id !== id);
     if (this.data.qcms.length !== prev) {
-      this.save();
+      stmtDeleteQcm.run(this.usernameKey, id);
       return true;
     }
     return false;
@@ -1469,7 +1877,7 @@ class Database {
       lastAttemptAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    this.save();
+    this.upsertQcmRow(this.data.qcms[idx]);
     return this.data.qcms[idx];
   }
 }
@@ -1481,7 +1889,7 @@ export function getUserDb(username: string): Database {
   let dbInstance = userDbs.get(norm);
   if (!dbInstance) {
     const userDir = path.resolve(DATA_DIR, "users", norm);
-    dbInstance = new Database(userDir);
+    dbInstance = new Database(userDir, norm);
     userDbs.set(norm, dbInstance);
   }
   return dbInstance;
@@ -1490,6 +1898,7 @@ export function getUserDb(username: string): Database {
 export function deleteUserDb(username: string): void {
   const norm = username.toLowerCase().trim();
   userDbs.delete(norm);
+  deleteAllUserSqliteData(norm);
   const userDir = path.resolve(DATA_DIR, "users", norm);
   if (fs.existsSync(userDir)) {
     try {

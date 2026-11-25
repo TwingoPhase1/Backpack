@@ -149,6 +149,9 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
   };
 
   const hours = Array.from({ length: 12 }, (_, i) => i + 8); // 8h to 19h
+  const HOUR_HEIGHT = 68;
+  const now = new Date();
+  const nowHours = now.getHours() + now.getMinutes() / 60;
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-white select-none">
@@ -364,10 +367,24 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                   ? "border-l-amber-500"
                   : "border-l-blue-500";
 
+                const fullTitle = formatCourseTitle(evt.summary, evt.matchedCode, resources);
+
                 return (
                   <div
                     key={evt.id}
-                    className={`bg-white rounded-xl border border-slate-200 border-l-4 ${leftBarColor} p-4 shadow-2xs hover:shadow-xs transition-shadow`}
+                    style={
+                      evt.isCancelled
+                        ? {
+                            backgroundImage:
+                              "repeating-linear-gradient(-45deg, transparent, transparent 8px, rgba(244,63,94,0.05) 8px, rgba(244,63,94,0.05) 16px)",
+                          }
+                        : undefined
+                    }
+                    className={`rounded-xl border border-l-4 p-4 shadow-2xs hover:shadow-sm transition-shadow ${
+                      evt.isCancelled
+                        ? "bg-rose-50/75 border-rose-300 border-l-rose-500"
+                        : `bg-white border-slate-200 ${leftBarColor}`
+                    }`}
                   >
                     <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -384,24 +401,32 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                           </span>
                         )}
                       </div>
+                      {evt.isCancelled && (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-rose-600 text-white text-[10px] font-extrabold uppercase tracking-wider shadow-2xs">
+                          Annulé
+                        </span>
+                      )}
                     </div>
 
                     <h3
                       onClick={() => setSelectedEvent(evt)}
                       className={`text-sm font-bold mb-2.5 cursor-pointer hover:text-blue-600 transition-colors ${
-                        evt.isCancelled ? "line-through text-rose-600" : "text-slate-900"
+                        evt.isCancelled
+                          ? "line-through decoration-rose-500/70 text-rose-900/75"
+                          : "text-slate-900"
                       }`}
                     >
-                      {evt.isCancelled && (
-                        <span className="inline-block mr-1.5 text-[10px] uppercase px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 no-underline">
-                          Annulé
-                        </span>
-                      )}
-                      {formatCourseTitle(evt.summary, evt.matchedCode, resources)}
+                      {fullTitle}
                     </h3>
 
+                    {evt.isCancelled && evt.aiUpdatedReason && (
+                      <div className="mb-3 px-2.5 py-1.5 rounded-lg bg-rose-100/80 border border-rose-200 text-[11px] font-medium text-rose-900">
+                        {evt.aiUpdatedReason}
+                      </div>
+                    )}
+
                     <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600 mb-3">
-                      {evt.visioUrl && (
+                      {!evt.isCancelled && evt.visioUrl && (
                         <a
                           href={evt.visioUrl}
                           target="_blank"
@@ -529,13 +554,14 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
             </div>
 
             {/* Hours Grid */}
-            <div className="flex-1 min-h-[720px] grid grid-cols-[60px_repeat(6,1fr)] relative">
+            <div className="flex-1 min-h-[816px] grid grid-cols-[60px_repeat(6,1fr)] relative">
               {/* Time axis column */}
               <div className="border-r border-slate-200 bg-slate-50/40">
                 {hours.map((h) => (
                   <div
                     key={h}
-                    className="h-[60px] border-b border-slate-100 text-[11px] font-mono text-slate-400 text-right pr-2 pt-1 select-none"
+                    style={{ height: `${HOUR_HEIGHT}px` }}
+                    className="h-[68px] border-b border-slate-100 text-[11px] font-mono text-slate-400 text-right pr-2 pt-1 select-none"
                   >
                     {h.toString().padStart(2, "0")}:00
                   </div>
@@ -544,6 +570,8 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
 
               {/* 6 Day Columns */}
               {weekDays.map((day, dayIndex) => {
+                const isToday = day.toDateString() === now.toDateString();
+                const showNowLine = isToday && nowHours >= 8 && nowHours <= 20;
                 const dayColumnEvents = weekEvents.filter((e) => {
                   const eDate = new Date(e.start);
                   return (
@@ -556,15 +584,29 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                 return (
                   <div
                     key={dayIndex}
-                    className="border-r border-slate-200 relative bg-white min-w-[110px]"
+                    className={`border-r border-slate-200 relative min-w-[115px] ${
+                      isToday ? "bg-blue-50/20" : "bg-white"
+                    }`}
                   >
                     {/* Horizontal hour lines */}
                     {hours.map((h) => (
                       <div
                         key={h}
-                        className="h-[60px] border-b border-slate-100 w-full pointer-events-none"
+                        style={{ height: `${HOUR_HEIGHT}px` }}
+                        className="h-[68px] border-b border-slate-100 w-full pointer-events-none"
                       />
                     ))}
+
+                    {/* Ligne de l'heure actuelle */}
+                    {showNowLine && (
+                      <div
+                        style={{ top: `${(nowHours - 8) * HOUR_HEIGHT}px` }}
+                        className="absolute inset-x-0 z-20 pointer-events-none flex items-center"
+                      >
+                        <div className="w-2 h-2 rounded-full bg-rose-500 -ml-1 shrink-0" />
+                        <div className="h-[2px] bg-rose-500 flex-1" />
+                      </div>
+                    )}
 
                     {/* Event Cards */}
                     {dayColumnEvents.map((evt) => {
@@ -575,8 +617,9 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       const endHour = endDate.getHours() + endDate.getMinutes() / 60;
                       const durationHours = endHour - startHour;
 
-                      const topPx = (startHour - 8) * 60;
-                      const heightPx = Math.max(durationHours * 60, 32);
+                      const topPx = (startHour - 8) * HOUR_HEIGHT;
+                      const heightPx = Math.max(durationHours * HOUR_HEIGHT, 40);
+                      const isShort = durationHours <= 1.1;
 
                       const isExam = evt.type === "Examen";
                       const isCM = evt.type === "CM";
@@ -584,58 +627,82 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       const isTD = evt.type === "TD";
                       const isSAE = evt.type === "SAE";
 
-                      const cardBg = isExam
-                        ? "bg-rose-50 border-rose-200 border-l-rose-500 text-rose-950"
+                      const cardBg = evt.isCancelled
+                        ? "bg-rose-50/90 border-rose-300 border-l-rose-500 text-rose-950"
+                        : isExam
+                        ? "bg-rose-50/90 border-rose-200 border-l-rose-500 text-rose-950"
                         : isCM
-                        ? "bg-purple-50 border-purple-200 border-l-purple-500 text-purple-950"
+                        ? "bg-purple-50/90 border-purple-200 border-l-purple-500 text-purple-950"
                         : isTP
-                        ? "bg-emerald-50 border-emerald-200 border-l-emerald-500 text-emerald-950"
+                        ? "bg-emerald-50/90 border-emerald-200 border-l-emerald-500 text-emerald-950"
                         : isTD
-                        ? "bg-sky-50 border-sky-200 border-l-sky-500 text-sky-950"
+                        ? "bg-sky-50/90 border-sky-200 border-l-sky-500 text-sky-950"
                         : isSAE
-                        ? "bg-amber-50 border-amber-200 border-l-amber-500 text-amber-950"
-                        : "bg-blue-50 border-blue-200 border-l-blue-500 text-blue-950";
+                        ? "bg-amber-50/90 border-amber-200 border-l-amber-500 text-amber-950"
+                        : "bg-blue-50/90 border-blue-200 border-l-blue-500 text-blue-950";
+
+                      const fullTitle = formatCourseTitle(evt.summary, evt.matchedCode, resources);
 
                       return (
                         <div
                           key={evt.id}
                           onClick={() => setSelectedEvent(evt)}
+                          title={fullTitle}
                           style={{
-                            top: `${topPx}px`,
-                            height: `${heightPx - 3}px`,
+                            top: `${topPx + 2}px`,
+                            height: `${heightPx - 4}px`,
+                            ...(evt.isCancelled
+                              ? {
+                                  backgroundImage:
+                                    "repeating-linear-gradient(-45deg, transparent, transparent 6px, rgba(244,63,94,0.06) 6px, rgba(244,63,94,0.06) 12px)",
+                                }
+                              : {}),
                           }}
-                          className={`absolute inset-x-1 rounded-lg p-2 border border-l-4 cursor-pointer hover:border-slate-400 transition-colors overflow-hidden flex flex-col justify-between group z-10 ${cardBg}`}
+                          className={`absolute inset-x-1 rounded-xl border border-l-4 cursor-pointer shadow-2xs hover:shadow-md hover:z-20 transition-all overflow-hidden flex flex-col justify-between group z-10 ${
+                            isShort ? "px-2 py-1.5" : "p-2.5"
+                          } ${cardBg}`}
                         >
                           <div className="min-w-0">
                             <div className="flex items-center justify-between gap-1 text-[10px] font-mono text-slate-600">
-                              <span>
+                              <span className="truncate font-semibold">
                                 {startDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} -{" "}
                                 {endDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                               </span>
-                              {evt.matchedCode && (
-                                <span className="font-bold px-1 rounded text-[9.5px] bg-white border border-slate-200 text-slate-700">
-                                  {evt.matchedCode}
-                                </span>
-                              )}
+                              <div className="flex items-center gap-1 shrink-0">
+                                {evt.isCancelled && (
+                                  <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-rose-600 text-white text-[9px] font-extrabold uppercase tracking-wider shadow-2xs shrink-0">
+                                    Annulé
+                                  </span>
+                                )}
+                                {evt.matchedCode && (
+                                  <span className="font-bold px-1.5 py-0.2 rounded-md text-[9.5px] bg-white/90 border border-slate-200/80 text-slate-700">
+                                    {evt.matchedCode}
+                                  </span>
+                                )}
+                              </div>
                             </div>
 
                             <h4
-                              className={`font-bold text-xs group-hover:text-blue-700 transition-colors mt-0.5 line-clamp-2 leading-tight ${
-                                evt.isCancelled ? "line-through text-rose-600" : "text-slate-900"
+                              className={`font-bold text-xs transition-colors mt-1 leading-snug ${
+                                isShort ? "line-clamp-1" : durationHours >= 2 ? "line-clamp-3" : "line-clamp-2"
+                              } ${
+                                evt.isCancelled
+                                  ? "line-through decoration-rose-500/70 text-rose-900/70"
+                                  : "text-slate-900 group-hover:text-blue-700"
                               }`}
                             >
-                              {formatCourseTitle(evt.summary, evt.matchedCode, resources)}
+                              {fullTitle}
                             </h4>
                           </div>
 
-                          <div className="flex items-center justify-between text-[10.5px] text-slate-600 mt-1 pt-0.5 gap-1">
-                            {evt.visioUrl ? (
+                          <div className="flex items-center justify-between text-[10px] text-slate-600 mt-1 pt-0.5 gap-1">
+                            {!evt.isCancelled && evt.visioUrl ? (
                               <a
                                 href={evt.visioUrl}
                                 target="_blank"
                                 rel="noreferrer"
                                 onClick={(e) => e.stopPropagation()}
-                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-600 text-white font-semibold text-[10px] hover:bg-indigo-700 shrink-0"
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-indigo-600 text-white font-semibold text-[10px] hover:bg-indigo-700 shrink-0 shadow-2xs"
                                 title="Rejoindre la visioconférence"
                               >
                                 <Video className="w-2.5 h-2.5" />
@@ -644,11 +711,13 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                             ) : evt.location ? (
                               <span className="flex items-center gap-1 font-mono text-[10px] truncate">
                                 <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
-                                {evt.location}
+                                <span className="truncate">{evt.location}</span>
                               </span>
-                            ) : <span />}
+                            ) : (
+                              <span />
+                            )}
                             {evt.group && (
-                              <span className="text-[9.5px] bg-white px-1.5 py-0.2 rounded text-slate-600 border border-slate-200 shrink-0">
+                              <span className="text-[9.5px] bg-white/90 px-1.5 py-0.2 rounded-md text-slate-600 border border-slate-200/80 shrink-0 font-medium">
                                 {evt.group}
                               </span>
                             )}
@@ -669,10 +738,19 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-3 md:p-4">
           <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg max-h-[90vh] flex flex-col shadow-sm overflow-hidden animate-in fade-in zoom-in-95 duration-150">
             {/* Modal Header */}
-            <div className="p-5 border-b border-slate-200 bg-slate-50">
+            <div
+              className={`p-5 border-b ${
+                selectedEvent.isCancelled ? "bg-rose-50 border-rose-200" : "bg-slate-50 border-slate-200"
+              }`}
+            >
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <div className="flex items-center gap-2 mb-1.5">
+                  <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                    {selectedEvent.isCancelled && (
+                      <span className="text-[10px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-md bg-rose-600 text-white shadow-2xs">
+                        Annulé
+                      </span>
+                    )}
                     {selectedEvent.matchedCode && (
                       <span className="text-xs font-mono font-bold px-2 py-0.5 rounded border bg-white border-slate-300 text-slate-800">
                         {selectedEvent.matchedCode}
@@ -682,7 +760,13 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       {selectedEvent.type}
                     </span>
                   </div>
-                  <h3 className="font-bold text-lg text-slate-900">
+                  <h3
+                    className={`font-bold text-lg ${
+                      selectedEvent.isCancelled
+                        ? "line-through decoration-rose-500/70 text-rose-900/80"
+                        : "text-slate-900"
+                    }`}
+                  >
                     {formatCourseTitle(selectedEvent.summary, selectedEvent.matchedCode, resources, {
                       includeCode: true,
                     })}

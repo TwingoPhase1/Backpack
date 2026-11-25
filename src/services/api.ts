@@ -541,9 +541,19 @@ export const api = {
     }>;
     hasNextPage: boolean;
     hasPrevPage: boolean;
+    currentPage?: number;
+    navItems?: Array<{
+      number: string;
+      pageIndex: number;
+      answered: boolean;
+      flagged: boolean;
+      isCurrent: boolean;
+      blocked?: boolean;
+    }>;
     allQuestions?: Array<{
       id: string;
       number: string;
+      pageIndex?: number;
       textHtml: string;
       flagField?: { name: string; checked: boolean };
       inputs: Array<{
@@ -577,7 +587,8 @@ export const api = {
     processUrl: string;
     hiddenFields: Record<string, string>;
     answers: Record<string, string | string[]>;
-    action: "next" | "prev" | "finish";
+    action: "next" | "prev" | "finish" | "goto";
+    targetPage?: number;
   }): Promise<any> {
     const res = await authFetch(`${API_BASE}/moodle/quiz/submit`, {
       method: "POST",

@@ -1009,6 +1009,8 @@ export class AIService {
     category: string;
     actionRequired: boolean;
     needsScheduleCheck: boolean;
+    needsSummary: boolean;
+    shouldNotify: boolean;
   } | null> {
     const input = `De : ${mail.from || ""}\nObjet : ${mail.subject || ""}\n\n${(mail.bodyText || "").slice(0, 3000)}`;
     const answers = await this.callGeminiDecisions(userConfig, input, {
@@ -1043,16 +1045,31 @@ export class AIService {
         instructions:
           "Ce mail mentionne-t-il un changement d'emploi du temps (annulation, report, nouvelle salle, rattrapage) ou contient-il un lien de visioconférence ?",
       },
+      needs_summary: {
+        type: "noul",
+        instructions:
+          "Ce mail est-il suffisamment long, dense ou détaillé (plusieurs phrases/paragraphes, consignes, informations multiples) pour qu'un résumé IA soit réellement utile ? Réponds non si le mail est très court (1-2 phrases qui se lisent immédiatement) ou trivial.",
+      },
+      should_notify: {
+        type: "noul",
+        instructions:
+          "Cet e-mail mérite-t-il d'envoyer une notification immédiate à l'étudiant ? Réponds oui uniquement s'il y a une info importante ou urgente à voir vite (cours annulé/déplacé, salle/visio, échéance/rendu, examen, note, demande d'un enseignant ou démarche administrative requise). Réponds non pour les newsletters, annonces génériques, publicités, ou mails secondaires sans urgence.",
+      },
     });
 
     if (!answers) return null;
     const prio = answers.priority?.choice;
     const cat = answers.category?.choice;
+    const resolvedPriority: "low" | "normal" | "high" | "urgent" = ["low", "normal", "high", "urgent"].includes(prio)
+      ? prio
+      : "normal";
     return {
-      priority: ["low", "normal", "high", "urgent"].includes(prio) ? prio : "normal",
+      priority: resolvedPriority,
       category: typeof cat === "string" ? cat : "Information",
       actionRequired: Number(answers.action_required?.noul ?? 0) >= 0.55,
       needsScheduleCheck: Number(answers.needs_schedule_update?.noul ?? answers.needs_schedule_check?.noul ?? 0) >= 0.5,
+      needsSummary: Number(answers.needs_summary?.noul ?? 0) >= 0.55,
+      shouldNotify: Number(answers.should_notify?.noul ?? 0) >= 0.55 || resolvedPriority === "urgent",
     };
   }
 
@@ -1597,19 +1614,51 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
       }));
     }
 
-    const res = await fetch(options.endpoint, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${options.apiKey.trim()}`,
-        "Content-Type": "application/json",
-        ...(options.extraHeaders || {}),
-      },
-      body: JSON.stringify(body),
-    });
+    const isGemini = options.providerLabel.toLowerCase().includes("gemini");
+    const fallbackModels = isGemini
+      ? [model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"].filter(
+          (m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx
+        )
+      : [model];
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Erreur ${options.providerLabel} (${res.status}): ${err}`);
+    let res: Response | null = null;
+    let lastErrText = "";
+    let lastStatus = 500;
+
+    for (let attemptIdx = 0; attemptIdx < fallbackModels.length; attemptIdx++) {
+      const currentModel = fallbackModels[attemptIdx];
+      const maxRetriesForModel = attemptIdx === 0 ? 2 : 1;
+
+      for (let retry = 0; retry < maxRetriesForModel; retry++) {
+        res = await fetch(options.endpoint, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${options.apiKey.trim()}`,
+            "Content-Type": "application/json",
+            ...(options.extraHeaders || {}),
+          },
+          body: JSON.stringify({ ...body, model: currentModel }),
+        });
+
+        if (res.ok) break;
+
+        lastStatus = res.status;
+        lastErrText = await res.text();
+        if (res.status === 503 || res.status === 429) {
+          console.warn(
+            `[AI] ${options.providerLabel} (${currentModel}) a renvoyé ${res.status}, tentative suivante...`
+          );
+          await new Promise((r) => setTimeout(r, 1200));
+        } else {
+          throw new Error(`Erreur ${options.providerLabel} (${res.status}): ${lastErrText}`);
+        }
+      }
+
+      if (res?.ok) break;
+    }
+
+    if (!res || !res.ok) {
+      throw new Error(`Erreur ${options.providerLabel} (${lastStatus}): ${lastErrText}`);
     }
 
     const data = await res.json();
@@ -2780,9 +2829,9 @@ RÈGLES STRICTES :
    * Pré-analyse toutes les questions d'une page de quiz Moodle en UNE SEULE requête batch
    * pour éviter les limites de débit (free tier) et accélérer l'affichage.
    */
-  public async answerQuizQuestionsBatchWithWebSearch(
+  private async runQuizChunkWithWebSearch(
     userConfig: AIUserConfig,
-    questions: Array<{ id: string; questionText: string; choicesText: string[] }>
+    chunk: Array<{ id: string; questionText: string; choicesText: string[] }>
   ): Promise<{
     results: Record<
       string,
@@ -2796,12 +2845,8 @@ RÈGLES STRICTES :
     provider: string;
     webSearchUsed: boolean;
   }> {
-    if (!questions.length) {
-      return { results: {}, provider: userConfig.activeProvider, webSearchUsed: false };
-    }
-
-    if (questions.length === 1) {
-      const q = questions[0];
+    if (chunk.length === 1) {
+      const q = chunk[0];
       const single = await this.answerQuizQuestionWithWebSearch(userConfig, {
         questionText: q.questionText,
         choicesText: q.choicesText,
@@ -2813,22 +2858,22 @@ RÈGLES STRICTES :
       };
     }
 
-    const questionsBlock = questions
+    const questionsBlock = chunk
       .map((q, idx) => {
         const choices =
           q.choicesText.length > 0
-            ? `\nChoix :\n${q.choicesText.map((c, i) => `  - ${c}`).join("\n")}`
+            ? `\nChoix :\n${q.choicesText.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}`
             : "";
         return `### Question ${idx + 1} (id: "${q.id}")\n${q.questionText}${choices}`;
       })
       .join("\n\n");
 
-    const promptText = `Tu es un assistant pédagogique universitaire. Analyse TOUTES les questions de quiz Moodle ci-dessous en UNE SEULE réponse.
+    const promptText = `Tu es un assistant pédagogique universitaire. Analyse les ${chunk.length} questions de quiz Moodle ci-dessous en UNE SEULE réponse.
 Réponds STRICTEMENT avec un tableau JSON valide (sans texte ni bloc markdown autour) où chaque élément correspond à une question :
 [
   {
     "id": "id exact de la question",
-    "answer": "**Réponse :** <réponse exacte ou texte exact des bons choix>\\n\\n**Explication :** <brève explication factuelle en français (Markdown + LaTeX $...$ autorisé)>"
+    "answer": "**Réponse :** <texte exact des bons choix (ou Choix N)>\\n\\n**Explication :** <brève explication factuelle en français (Markdown + LaTeX $...$ autorisé)>"
   }
 ]
 
@@ -2838,7 +2883,7 @@ ${questionsBlock}`;
     const res = await this.runPromptWithWebSearch(
       userConfig,
       promptText,
-      questions[0]?.questionText
+      chunk[0]?.questionText
     );
 
     const cleaned = res.answer.replace(/```json\s*|\s*```/g, "").trim();
@@ -2860,8 +2905,8 @@ ${questionsBlock}`;
           parsed.forEach((item, idx) => {
             if (!item || !item.answer) return;
             const matchedQ =
-              questions.find((q) => q.id === String(item.id)) ||
-              (parsed.length === questions.length ? questions[idx] : undefined);
+              chunk.find((q) => q.id === String(item.id)) ||
+              (parsed.length === chunk.length ? chunk[idx] : undefined);
             if (matchedQ) {
               results[matchedQ.id] = {
                 answer: String(item.answer),
@@ -2877,8 +2922,8 @@ ${questionsBlock}`;
       }
     }
 
-    // Fallback individuel pour toute question manquante dans le batch
-    for (const q of questions) {
+    // Fallback individuel uniquement pour une éventuelle question manquante dans ce paquet de 3
+    for (const q of chunk) {
       if (!results[q.id]) {
         try {
           results[q.id] = await this.answerQuizQuestionWithWebSearch(userConfig, {
@@ -2895,6 +2940,54 @@ ${questionsBlock}`;
       results,
       provider: res.provider,
       webSearchUsed: res.webSearchUsed,
+    };
+  }
+
+  public async answerQuizQuestionsBatchWithWebSearch(
+    userConfig: AIUserConfig,
+    questions: Array<{ id: string; questionText: string; choicesText: string[] }>
+  ): Promise<{
+    results: Record<
+      string,
+      {
+        answer: string;
+        sources: Array<{ title: string; url: string }>;
+        provider: string;
+        webSearchUsed: boolean;
+      }
+    >;
+    provider: string;
+    webSearchUsed: boolean;
+  }> {
+    if (!questions.length) {
+      return { results: {}, provider: userConfig.activeProvider, webSearchUsed: false };
+    }
+
+    const CHUNK_SIZE = 3;
+    const allResults: Record<
+      string,
+      {
+        answer: string;
+        sources: Array<{ title: string; url: string }>;
+        provider: string;
+        webSearchUsed: boolean;
+      }
+    > = {};
+    let lastProvider: string = userConfig.activeProvider;
+    let anyWebSearch = false;
+
+    for (let i = 0; i < questions.length; i += CHUNK_SIZE) {
+      const chunk = questions.slice(i, i + CHUNK_SIZE);
+      const chunkRes = await this.runQuizChunkWithWebSearch(userConfig, chunk);
+      Object.assign(allResults, chunkRes.results);
+      lastProvider = chunkRes.provider;
+      anyWebSearch = anyWebSearch || chunkRes.webSearchUsed;
+    }
+
+    return {
+      results: allResults,
+      provider: lastProvider,
+      webSearchUsed: anyWebSearch,
     };
   }
 }

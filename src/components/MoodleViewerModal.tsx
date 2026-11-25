@@ -20,13 +20,18 @@ import {
   Sparkles,
   Globe,
   Video,
+  ChevronLeft,
+  ChevronRight,
+  FolderPlus,
 } from "lucide-react";
+import { AddToSpaceModal } from "./AddToSpaceModal";
 
 function isOptionSuggestedByAI(
   answer: string | undefined,
   labelHtml: string | undefined,
   value: string | undefined,
-  decisionPick?: string
+  decisionPick?: string,
+  choiceNumber?: number
 ): boolean {
   if (!answer && !decisionPick) return false;
   const normalize = (s: string) =>
@@ -51,9 +56,28 @@ function isOptionSuggestedByAI(
   }
 
   if (!answer) return false;
-  // Extraire uniquement le bloc Réponse (entre "Réponse :" et "Explication :") si présent
-  const respMatch = answer.match(/(?:\*\*|)?R[ée]ponse\s*:?\s*(?:\*\*|)?([\s\S]*?)(?=(?:\*\*|)?Explication|$)/i);
+  // Extraire uniquement le bloc Réponse (entre "Réponse ... :" et "Explication") si présent
+  const respMatch = answer.match(/(?:\*\*|)?R[ée]ponse[^\n:]*:\s*(?:\*\*|)?([\s\S]*?)(?=(?:\*\*|)?Explication|$)/i);
   const answerSection = respMatch ? respMatch[1] : (answer.split(/\*\*\s*Explication/i)[0] || answer);
+
+  // Détecter les réponses numérotées (ex: "Choix 2 et 3", "Réponses 1, 3", "Option 2")
+  if (typeof choiceNumber === "number" && choiceNumber > 0) {
+    const numberedMatches = answerSection.matchAll(
+      /(?:choix|r[ée]ponses?|options?)\s*(?:n[°o]|num[ée]ro|#)?\s*([0-9]+(?:\s*(?:,|et|ou|\/|&|-)\s*[0-9]+)*)/gi
+    );
+    for (const m of numberedMatches) {
+      const nums = (m[1].match(/\d+/g) || []).map((n) => parseInt(n, 10));
+      if (nums.includes(choiceNumber)) return true;
+    }
+    const bareNumbersOnly = answerSection
+      .replace(/\*\*/g, "")
+      .trim()
+      .match(/^([0-9]+(?:\s*(?:,|et|ou|\/|&)\s*[0-9]+)*)\.?$/i);
+    if (bareNumbersOnly) {
+      const nums = (bareNumbersOnly[1].match(/\d+/g) || []).map((n) => parseInt(n, 10));
+      if (nums.includes(choiceNumber)) return true;
+    }
+  }
 
   const normAnswer = normalize(answerSection);
   const escaped = normLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -86,11 +110,14 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
   // Quiz state
   const [quizInfo, setQuizInfo] = useState<Awaited<ReturnType<typeof api.getMoodleQuizInfo>> | null>(null);
   const [quizAttempt, setQuizAttempt] = useState<Awaited<ReturnType<typeof api.startMoodleQuiz>> | null>(null);
+  const [allQuizQuestions, setAllQuizQuestions] = useState<QuizQuestionItem[]>([]);
+  const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
   const [quizAnswers, setQuizAnswers] = useState<Record<string, string | string[]>>({});
   const [quizReviewHtml, setQuizReviewHtml] = useState<string | null>(null);
   const [quizBusy, setQuizBusy] = useState(false);
   const [bbbEmbedUrl, setBbbEmbedUrl] = useState<string | null>(null);
   const [bbbLoading, setBbbLoading] = useState(false);
+  const [addToSpaceFile, setAddToSpaceFile] = useState<{ name: string; url: string } | null>(null);
   const [quizAiHelp, setQuizAiHelp] = useState<
     Record<
       string,
@@ -131,7 +158,7 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
         }
       }
     }
-    setQuizAnswers(init);
+    setQuizAnswers((prev) => ({ ...prev, ...init }));
   };
 
   useEffect(() => {
@@ -143,6 +170,8 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
       setSelectedFile(null);
       setQuizInfo(null);
       setQuizAttempt(null);
+      setAllQuizQuestions([]);
+      setActiveQuestionId(null);
       setQuizAnswers({});
       setQuizReviewHtml(null);
       return;
@@ -161,6 +190,8 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
     setSubmitFeedback(null);
     setQuizInfo(null);
     setQuizAttempt(null);
+    setAllQuizQuestions([]);
+    setActiveQuestionId(null);
     setQuizReviewHtml(null);
     setQuizAiHelp({});
     setBbbEmbedUrl(null);
@@ -207,6 +238,23 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
 
   const isImageUrl = (name: string) => /\.(png|jpe?g|gif|webp|svg)$/i.test(name);
 
+  type QuizQuestionItem = NonNullable<Awaited<ReturnType<typeof api.startMoodleQuiz>>["allQuestions"]>[number];
+
+  const isQuestionAnswered = (q: QuizQuestionItem): boolean => {
+    return q.inputs.some((inp) => {
+      const val = quizAnswers[inp.name];
+      if (Array.isArray(val)) return val.length > 0;
+      return typeof val === "string" && val.trim().length > 0;
+    });
+  };
+
+  const scrollToQuestionCard = (qId: string) => {
+    setActiveQuestionId(qId);
+    setTimeout(() => {
+      document.getElementById(`quiz-q-${qId}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 40);
+  };
+
   const handleStartQuiz = async () => {
     if (!target) return;
     setQuizBusy(true);
@@ -214,14 +262,14 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
     try {
       const attempt = await api.startMoodleQuiz(target.url);
       setQuizAttempt(attempt);
+      setQuizAnswers({});
       initAnswersFromAttempt(attempt);
-      const allQ = attempt.allQuestions?.length ? attempt.allQuestions : attempt.questions || [];
+      const allQ = (attempt.allQuestions?.length ? attempt.allQuestions : attempt.questions || []) as QuizQuestionItem[];
+      setAllQuizQuestions(allQ);
       if (allQ.length > 0) {
-        // Lancer la 1ère question immédiatement à part + toutes les autres en 1 seul batch en parallèle
-        void handleAskQuizAI(allQ[0]);
-        if (allQ.length > 1) {
-          void handleAskQuizAIBatch(allQ.slice(1));
-        }
+        setActiveQuestionId(attempt.questions[0]?.id || allQ[0]?.id || null);
+        // Traiter les questions par paquets de 3
+        void handleAskQuizAIBatch(allQ);
       }
     } catch (err: any) {
       setError(err.message || "Impossible de démarrer le questionnaire.");
@@ -230,7 +278,11 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
     }
   };
 
-  const handleSubmitQuiz = async (action: "next" | "prev" | "finish") => {
+  const handleSubmitQuiz = async (
+    action: "next" | "prev" | "finish" | "goto",
+    targetPage?: number,
+    focusQuestionId?: string
+  ) => {
     if (!quizAttempt) return;
     setQuizBusy(true);
     setError(null);
@@ -240,14 +292,35 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
         hiddenFields: quizAttempt.hiddenFields,
         answers: quizAnswers,
         action,
+        targetPage,
       });
       if (res.status === "finished") {
         setQuizReviewHtml(res.reviewHtml || "<p>Questionnaire envoyé avec succès.</p>");
         setQuizAttempt(null);
+        setAllQuizQuestions([]);
+        setActiveQuestionId(null);
       } else {
         setQuizAttempt(res);
         initAnswersFromAttempt(res);
-        void handleAskQuizAIBatch(res.questions || []);
+        const pageQs: QuizQuestionItem[] = res.questions || [];
+        const pageIdx = Number(res.currentPage ?? res.hiddenFields?.thispage ?? 0);
+        setAllQuizQuestions((prev) => {
+          const merged = new Map<string, QuizQuestionItem>();
+          for (const item of prev) merged.set(item.id, item);
+          for (const q of pageQs) merged.set(q.id, { ...q, pageIndex: pageIdx });
+          return Array.from(merged.values()).sort((a, b) => {
+            const na = parseInt(a.number || "", 10);
+            const nb = parseInt(b.number || "", 10);
+            if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) return na - nb;
+            return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+          });
+        });
+        const focusId =
+          focusQuestionId && pageQs.some((q) => q.id === focusQuestionId)
+            ? focusQuestionId
+            : pageQs[0]?.id;
+        if (focusId) scrollToQuestionCard(focusId);
+        void handleAskQuizAIBatch(pageQs);
       }
     } catch (err: any) {
       setError(err.message || "Erreur lors de l'envoi des réponses.");
@@ -256,7 +329,46 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
     }
   };
 
-  type QuizQuestionItem = Awaited<ReturnType<typeof api.startMoodleQuiz>>["questions"][number];
+  const jumpToQuestion = (q: QuizQuestionItem) => {
+    if (!quizAttempt) return;
+    if (quizAttempt.questions.some((cur) => cur.id === q.id)) {
+      scrollToQuestionCard(q.id);
+    } else if (typeof q.pageIndex === "number" && !quizBusy) {
+      void handleSubmitQuiz("goto", q.pageIndex, q.id);
+    }
+  };
+
+  const stepQuestion = (delta: -1 | 1) => {
+    if (!quizAttempt) return;
+    if (quizAttempt.navItems && quizAttempt.navItems.length > 0) {
+      const items = quizAttempt.navItems;
+      const curIdx = items.findIndex((it) => {
+        const curQ = quizAttempt.questions.find((q) => q.number === it.number);
+        return curQ ? curQ.id === activeQuestionId : it.isCurrent;
+      });
+      const baseIdx = curIdx >= 0 ? curIdx : 0;
+      const nextIdx = Math.max(0, Math.min(items.length - 1, baseIdx + delta));
+      const targetItem = items[nextIdx];
+      if (!targetItem || targetItem.blocked) return;
+      const curQ = quizAttempt.questions.find((q) => q.number === targetItem.number);
+      if (curQ) {
+        scrollToQuestionCard(curQ.id);
+      } else if (!quizBusy) {
+        const knownQ = allQuizQuestions.find((q) => q.number === targetItem.number);
+        void handleSubmitQuiz("goto", targetItem.pageIndex, knownQ?.id);
+      }
+      return;
+    }
+
+    const navList = allQuizQuestions.length > 0 ? allQuizQuestions : (quizAttempt.questions as QuizQuestionItem[]);
+    if (navList.length === 0) return;
+    const currentIdx = navList.findIndex((q) => q.id === activeQuestionId);
+    const baseIdx = currentIdx >= 0 ? currentIdx : 0;
+    const nextIdx = Math.max(0, Math.min(navList.length - 1, baseIdx + delta));
+    if (nextIdx !== baseIdx || currentIdx < 0) {
+      jumpToQuestion(navList[nextIdx]);
+    }
+  };
 
   const extractQuestionPayload = (q: QuizQuestionItem) => {
     const stripHtml = (h: string) =>
@@ -290,60 +402,43 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
       return next;
     });
 
-    try {
-      const payload = pendingQuestions.map(extractQuestionPayload);
-      const batchRes = await api.getMoodleQuizAIHelpBatch(payload);
-      setQuizAiHelp((prev) => {
-        const next = { ...prev };
-        for (const q of pendingQuestions) {
-          const item = batchRes.results?.[q.id];
-          if (item) {
-            next[q.id] = {
-              loading: false,
-              answer: item.answer,
-              sources: item.sources,
-              provider: item.provider,
-              webSearchUsed: item.webSearchUsed,
-            };
-          } else {
-            next[q.id] = { loading: false, error: "Réponse non reçue dans le batch" };
-          }
-        }
-        return next;
-      });
-    } catch (err: any) {
-      setQuizAiHelp((prev) => {
-        const next = { ...prev };
-        for (const q of pendingQuestions) {
-          next[q.id] = { loading: false, error: err.message || "Erreur assistance IA batch" };
-        }
-        return next;
-      });
+    const BATCH_SIZE = 3;
+    const chunks: QuizQuestionItem[][] = [];
+    for (let i = 0; i < pendingQuestions.length; i += BATCH_SIZE) {
+      chunks.push(pendingQuestions.slice(i, i + BATCH_SIZE));
     }
-  };
 
-  const handleAskQuizAI = async (q: QuizQuestionItem) => {
-    setQuizAiHelp((prev) => ({ ...prev, [q.id]: { loading: true } }));
-    try {
-      const { questionText, choicesText } = extractQuestionPayload(q);
-      const res = await api.getMoodleQuizAIHelp({ questionText, choicesText });
-      setQuizAiHelp((prev) => ({
-        ...prev,
-        [q.id]: {
-          loading: false,
-          answer: res.answer,
-          sources: res.sources,
-          provider: res.provider,
-          webSearchUsed: res.webSearchUsed,
-          decisionPick: res.decisionPick,
-          decisionConfidence: res.decisionConfidence,
-        },
-      }));
-    } catch (err: any) {
-      setQuizAiHelp((prev) => ({
-        ...prev,
-        [q.id]: { loading: false, error: err.message || "Erreur assistance IA" },
-      }));
+    for (const chunk of chunks) {
+      try {
+        const payload = chunk.map(extractQuestionPayload);
+        const batchRes = await api.getMoodleQuizAIHelpBatch(payload);
+        setQuizAiHelp((prev) => {
+          const next = { ...prev };
+          for (const q of chunk) {
+            const item = batchRes.results?.[q.id];
+            if (item) {
+              next[q.id] = {
+                loading: false,
+                answer: item.answer,
+                sources: item.sources,
+                provider: item.provider,
+                webSearchUsed: item.webSearchUsed,
+              };
+            } else {
+              next[q.id] = { loading: false, error: "Réponse non reçue dans le batch" };
+            }
+          }
+          return next;
+        });
+      } catch (err: any) {
+        setQuizAiHelp((prev) => {
+          const next = { ...prev };
+          for (const q of chunk) {
+            next[q.id] = { loading: false, error: err.message || "Erreur assistance IA batch" };
+          }
+          return next;
+        });
+      }
     }
   };
 
@@ -374,14 +469,40 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
               </button>
             )}
             {(previewFile || target.type === "resource") && (
-              <a
-                href={api.getMoodleDownloadUrl(previewFile ? previewFile.url : target.url)}
-                download
-                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Télécharger</span>
-              </a>
+              <>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setAddToSpaceFile({
+                      name: previewFile ? previewFile.name : target.title,
+                      url: api.getMoodlePreviewUrl(previewFile ? previewFile.url : target.url),
+                    })
+                  }
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  title="Ajouter ce fichier dans un cours, TP ou TD"
+                >
+                  <FolderPlus className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Ajouter à mon espace</span>
+                </button>
+                <a
+                  href={api.getMoodlePreviewUrl(previewFile ? previewFile.url : target.url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-2.5 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                  title="Ouvrir dans un nouvel onglet"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span className="hidden md:inline">Nouvel onglet</span>
+                </a>
+                <a
+                  href={api.getMoodleDownloadUrl(previewFile ? previewFile.url : target.url)}
+                  download
+                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Télécharger</span>
+                </a>
+              </>
             )}
             <button
               onClick={onClose}
@@ -403,6 +524,41 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                   alt={previewFile.name}
                   className="max-w-full max-h-full object-contain p-4"
                 />
+              ) : /\.(docx?|pptx?|xlsx?|odt|ods|odp|zip|rar|7z)$/i.test(previewFile.name || previewFile.url) ? (
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 max-w-md text-center space-y-4 shadow-sm m-4">
+                  <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 border border-blue-200 flex items-center justify-center mx-auto">
+                    <FileText className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-slate-900 break-words">{previewFile.name}</h4>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Ce format ne peut pas être prévisualisé directement dans le navigateur.
+                    </p>
+                  </div>
+                  <div className="flex items-center justify-center gap-2 flex-wrap">
+                    <a
+                      href={api.getMoodleDownloadUrl(previewFile.url)}
+                      download
+                      className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Télécharger</span>
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setAddToSpaceFile({
+                          name: previewFile.name,
+                          url: api.getMoodlePreviewUrl(previewFile.url),
+                        })
+                      }
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <FolderPlus className="w-3.5 h-3.5" />
+                      <span>Ajouter à mon espace</span>
+                    </button>
+                  </div>
+                </div>
               ) : (
                 <iframe
                   src={api.getMoodlePreviewUrl(previewFile.url)}
@@ -435,6 +591,167 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
             </div>
           ) : isQuiz && quizAttempt ? (
             <div className="p-5 sm:p-6 space-y-5">
+              {/* Barre de navigation sticky entre les questions */}
+              {(() => {
+                const officialNav = quizAttempt.navItems && quizAttempt.navItems.length > 0 ? quizAttempt.navItems : null;
+                const navQuestions =
+                  allQuizQuestions.length > 0 ? allQuizQuestions : (quizAttempt.questions as QuizQuestionItem[]);
+                const totalItems = officialNav ? officialNav.length : navQuestions.length;
+                if (totalItems === 0) return null;
+
+                const answeredCount = officialNav
+                  ? officialNav.filter((it) => {
+                      const curQ = quizAttempt.questions.find((q) => q.number === it.number);
+                      return curQ ? isQuestionAnswered(curQ) : it.answered;
+                    }).length
+                  : navQuestions.filter((nq) => isQuestionAnswered(nq)).length;
+
+                const currentNavIdx = officialNav
+                  ? Math.max(
+                      0,
+                      officialNav.findIndex((it) => {
+                        const curQ = quizAttempt.questions.find((q) => q.number === it.number);
+                        return curQ ? curQ.id === activeQuestionId : it.isCurrent;
+                      })
+                    )
+                  : Math.max(
+                      0,
+                      navQuestions.findIndex((nq) => nq.id === activeQuestionId)
+                    );
+
+                return (
+                  <div className="sticky top-0 z-20 -mx-5 sm:-mx-6 -mt-5 sm:-mt-6 mb-5 px-5 py-3 bg-white/95 backdrop-blur-xs border-b border-slate-200 shadow-2xs space-y-2.5">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => stepQuestion(-1)}
+                          disabled={quizBusy || currentNavIdx <= 0}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold border border-slate-200 cursor-pointer disabled:opacity-40"
+                          title="Question précédente"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" />
+                          <span>Préc.</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => stepQuestion(1)}
+                          disabled={quizBusy || currentNavIdx >= totalItems - 1}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold border border-slate-200 cursor-pointer disabled:opacity-40"
+                          title="Question suivante"
+                        >
+                          <span>Suiv.</span>
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-[11px] text-slate-600">
+                        <span className="font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
+                          {answeredCount} / {totalItems} répondue{answeredCount > 1 ? "s" : ""}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {officialNav
+                        ? officialNav.map((it) => {
+                            const curQ = quizAttempt.questions.find((q) => q.number === it.number);
+                            const knownQ = curQ || allQuizQuestions.find((q) => q.number === it.number);
+                            const isActive = curQ ? curQ.id === activeQuestionId : it.isCurrent;
+                            const isCurrentPage = Boolean(curQ);
+                            const isAnswered = curQ ? isQuestionAnswered(curQ) : it.answered;
+                            const isFlagged = curQ
+                              ? Boolean(curQ.flagField && quizAnswers[curQ.flagField.name] === "1")
+                              : it.flagged;
+                            const hasAi = Boolean(knownQ && quizAiHelp[knownQ.id]?.answer);
+
+                            return (
+                              <button
+                                key={`nav-${it.number}`}
+                                type="button"
+                                onClick={() => {
+                                  if (curQ) {
+                                    scrollToQuestionCard(curQ.id);
+                                  } else if (!it.blocked && !quizBusy) {
+                                    void handleSubmitQuiz("goto", it.pageIndex, knownQ?.id);
+                                  }
+                                }}
+                                disabled={quizBusy || it.blocked}
+                                title={`Question ${it.number}${
+                                  it.blocked ? " (verrouillée)" : isCurrentPage ? "" : " (autre page)"
+                                }`}
+                                className={`relative min-w-[28px] h-7 px-1.5 rounded-lg text-[11px] font-mono font-bold border transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                                  isActive
+                                    ? "ring-2 ring-indigo-500 border-indigo-600 bg-indigo-50 text-indigo-800"
+                                    : isAnswered
+                                    ? "bg-emerald-50 border-emerald-300 text-emerald-800 hover:bg-emerald-100"
+                                    : isCurrentPage
+                                    ? "bg-white border-slate-300 text-slate-700 hover:bg-slate-100"
+                                    : "bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100"
+                                }`}
+                              >
+                                {it.number}
+                                {isFlagged && (
+                                  <span
+                                    className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-rose-500 ring-1 ring-white"
+                                    title="Question marquée"
+                                  />
+                                )}
+                                {hasAi && (
+                                  <span
+                                    className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-indigo-500 ring-1 ring-white"
+                                    title="Réponse IA prête"
+                                  />
+                                )}
+                              </button>
+                            );
+                          })
+                        : navQuestions.map((nq, idx) => {
+                            const isActive = nq.id === activeQuestionId;
+                            const isCurrentPage = quizAttempt.questions.some((cur) => cur.id === nq.id);
+                            const isAnswered = isQuestionAnswered(nq);
+                            const isFlagged = Boolean(nq.flagField && quizAnswers[nq.flagField.name] === "1");
+                            const hasAi = Boolean(quizAiHelp[nq.id]?.answer);
+                            const label = (nq.number || "").trim() || String(idx + 1);
+
+                            return (
+                              <button
+                                key={nq.id}
+                                type="button"
+                                onClick={() => jumpToQuestion(nq)}
+                                disabled={quizBusy}
+                                title={`Question ${label}${isCurrentPage ? "" : " (autre page)"}`}
+                                className={`relative min-w-[28px] h-7 px-1.5 rounded-lg text-[11px] font-mono font-bold border transition-all cursor-pointer disabled:opacity-50 ${
+                                  isActive
+                                    ? "ring-2 ring-indigo-500 border-indigo-600 bg-indigo-50 text-indigo-800"
+                                    : isAnswered
+                                    ? "bg-emerald-50 border-emerald-300 text-emerald-800 hover:bg-emerald-100"
+                                    : isCurrentPage
+                                    ? "bg-white border-slate-300 text-slate-700 hover:bg-slate-100"
+                                    : "bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100"
+                                }`}
+                              >
+                                {label}
+                                {isFlagged && (
+                                  <span
+                                    className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-rose-500 ring-1 ring-white"
+                                    title="Question marquée"
+                                  />
+                                )}
+                                {hasAi && (
+                                  <span
+                                    className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-indigo-500 ring-1 ring-white"
+                                    title="Réponse IA prête"
+                                  />
+                                )}
+                              </button>
+                            );
+                          })}
+                    </div>
+                  </div>
+                );
+              })()}
+
               {quizAttempt.questions.length === 0 ? (
                 <p className="text-xs text-slate-500 text-center py-8">Aucune question détectée sur cette page.</p>
               ) : (
@@ -442,7 +759,14 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                   const isFlagged = Boolean(q.flagField && quizAnswers[q.flagField.name] === "1");
                   const aiState = quizAiHelp[q.id];
                   return (
-                  <div key={q.id} className="bg-white border border-slate-200 rounded-2xl p-5 space-y-4 shadow-xs">
+                  <div
+                    key={q.id}
+                    id={`quiz-q-${q.id}`}
+                    onClick={() => setActiveQuestionId(q.id)}
+                    className={`scroll-mt-28 bg-white border rounded-2xl p-5 space-y-4 shadow-xs transition-colors ${
+                      activeQuestionId === q.id ? "border-indigo-300 ring-1 ring-indigo-200" : "border-slate-200"
+                    }`}
+                  >
                     <div className="flex items-center justify-between gap-2 flex-wrap">
                       <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
                         Question {q.number || qIdx + 1}
@@ -478,9 +802,18 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                     )}
                     <div className="space-y-2 pt-1">
                       {q.inputs.map((inp, iIdx) => {
+                        const choiceNum = q.inputs
+                          .slice(0, iIdx + 1)
+                          .filter((x) => x.kind === "radio" || x.kind === "checkbox").length;
                         if (inp.kind === "radio") {
                           const checked = quizAnswers[inp.name] === inp.value;
-                          const isAiPick = isOptionSuggestedByAI(aiState?.answer, inp.labelHtml, inp.value, aiState?.decisionPick);
+                          const isAiPick = isOptionSuggestedByAI(
+                            aiState?.answer,
+                            inp.labelHtml,
+                            inp.value,
+                            aiState?.decisionPick,
+                            choiceNum
+                          );
                           return (
                             <label
                               key={`${inp.name}-${iIdx}`}
@@ -518,7 +851,13 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                         if (inp.kind === "checkbox") {
                           const arr = Array.isArray(quizAnswers[inp.name]) ? (quizAnswers[inp.name] as string[]) : [];
                           const checked = inp.value !== undefined && arr.includes(inp.value);
-                          const isAiPick = isOptionSuggestedByAI(aiState?.answer, inp.labelHtml, inp.value, aiState?.decisionPick);
+                          const isAiPick = isOptionSuggestedByAI(
+                            aiState?.answer,
+                            inp.labelHtml,
+                            inp.value,
+                            aiState?.decisionPick,
+                            choiceNum
+                          );
                           return (
                             <label
                               key={`${inp.name}-${iIdx}`}
@@ -745,7 +1084,7 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                       </div>
                       <div>
                         <p className="text-xs font-bold text-indigo-950">Classe virtuelle BigBlueButton</p>
-                        <p className="text-[11px] text-indigo-700">Rejoindre la salle directement dans Backpack</p>
+                        <p className="text-[11px] text-indigo-700">Ouverture directe dans un nouvel onglet</p>
                       </div>
                     </div>
                     <button
@@ -753,10 +1092,17 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                       disabled={bbbLoading}
                       onClick={async () => {
                         setBbbLoading(true);
+                        const popup = window.open("", "_blank");
                         try {
                           const url = await api.resolveMoodleBbbJoin(activity.bbbJoinEndpoint!);
                           setBbbEmbedUrl(url);
+                          if (popup) {
+                            popup.location.href = url;
+                          } else {
+                            window.open(url, "_blank", "noopener,noreferrer");
+                          }
                         } catch (err: any) {
+                          if (popup) popup.close();
                           setError(err.message || "Impossible de rejoindre la session");
                         } finally {
                           setBbbLoading(false);
@@ -764,30 +1110,23 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                       }}
                       className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold flex items-center gap-2 cursor-pointer disabled:opacity-50"
                     >
-                      {bbbLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Video className="w-3.5 h-3.5" />}
-                      <span>{bbbLoading ? "Connexion..." : "Entrer dans la session"}</span>
+                      {bbbLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ExternalLink className="w-3.5 h-3.5" />}
+                      <span>{bbbLoading ? "Connexion..." : "Ouvrir la visio"}</span>
                     </button>
                   </div>
 
                   {bbbEmbedUrl && (
-                    <div className="space-y-2">
-                      <iframe
-                        src={bbbEmbedUrl}
-                        title={activity.title}
-                        allow="camera; microphone; display-capture; autoplay; fullscreen"
-                        className="w-full h-[60vh] rounded-xl border border-indigo-200 bg-slate-900"
-                      />
-                      <div className="flex justify-end">
-                        <a
-                          href={bbbEmbedUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-[11px] font-semibold text-indigo-700 hover:text-indigo-900 inline-flex items-center gap-1"
-                        >
-                          <span>Ouvrir en plein écran si le micro/caméra bloque</span>
-                          <ExternalLink className="w-3 h-3" />
-                        </a>
-                      </div>
+                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-indigo-200/70">
+                      <span className="text-[11px] text-indigo-800">Si l&apos;onglet ne s&apos;est pas ouvert automatiquement :</span>
+                      <a
+                        href={bbbEmbedUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs font-bold text-indigo-700 hover:text-indigo-900 inline-flex items-center gap-1"
+                      >
+                        <span>Rejoindre la visio</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
                     </div>
                   )}
                 </div>
@@ -930,6 +1269,16 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
           ) : null}
         </div>
       </div>
+
+      {addToSpaceFile && (
+        <AddToSpaceModal
+          isOpen={Boolean(addToSpaceFile)}
+          onClose={() => setAddToSpaceFile(null)}
+          fileName={addToSpaceFile.name}
+          fileUrl={addToSpaceFile.url}
+          sourceLabel="Moodle"
+        />
+      )}
     </div>
   );
 };

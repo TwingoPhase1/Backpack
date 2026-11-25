@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { MoodleAssignment, MoodleCourse, MoodleSyncStatus, Resource } from "../types";
 import { api } from "../services/api";
 import { MoodleViewerModal, MoodleViewerTarget } from "./MoodleViewerModal";
+import { AddToSpaceModal } from "./AddToSpaceModal";
 import { groupMoodleSections } from "../utils/moodleSections";
 import {
   BookOpen,
@@ -18,6 +19,7 @@ import {
   Link2,
   ChevronDown,
   ChevronRight,
+  FolderPlus,
 } from "lucide-react";
 
 interface MoodleViewProps {
@@ -35,6 +37,7 @@ export const MoodleView: React.FC<MoodleViewProps> = ({ resources, onOpenResourc
   const [selectedSectionId, setSelectedSectionId] = useState<string>("ALL");
   const [expandedSubsections, setExpandedSubsections] = useState<Record<string, boolean>>({});
   const [viewerTarget, setViewerTarget] = useState<MoodleViewerTarget | null>(null);
+  const [addToSpaceFile, setAddToSpaceFile] = useState<{ name: string; url: string; resourceCode?: string } | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -415,14 +418,31 @@ export const MoodleView: React.FC<MoodleViewProps> = ({ resources, onOpenResourc
                                 <span>Ouvrir</span>
                               </button>
                               {isDirectFile && (
-                                <a
-                                  href={api.getMoodleDownloadUrl(file.url)}
-                                  download
-                                  className="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg"
-                                  title="Télécharger"
-                                >
-                                  <Download className="w-3.5 h-3.5" />
-                                </a>
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setAddToSpaceFile({
+                                        name: mod.name,
+                                        url: api.getMoodlePreviewUrl(file.url),
+                                        resourceCode: linkedResource?.code || selectedCourse.resourceCode,
+                                      })
+                                    }
+                                    className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-lg text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                                    title="Ajouter à mon espace (Cours, TP ou TD)"
+                                  >
+                                    <FolderPlus className="w-3.5 h-3.5" />
+                                    <span className="hidden lg:inline">Mon espace</span>
+                                  </button>
+                                  <a
+                                    href={api.getMoodleDownloadUrl(file.url)}
+                                    download
+                                    className="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg"
+                                    title="Télécharger"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                  </a>
+                                </>
                               )}
                             </div>
                           </div>
@@ -442,6 +462,16 @@ export const MoodleView: React.FC<MoodleViewProps> = ({ resources, onOpenResourc
       </div>
 
       <MoodleViewerModal target={viewerTarget} onClose={() => setViewerTarget(null)} />
+      {addToSpaceFile && (
+        <AddToSpaceModal
+          isOpen={Boolean(addToSpaceFile)}
+          onClose={() => setAddToSpaceFile(null)}
+          fileName={addToSpaceFile.name}
+          fileUrl={addToSpaceFile.url}
+          sourceLabel="Moodle"
+          defaultResourceCode={addToSpaceFile.resourceCode}
+        />
+      )}
     </div>
   );
 };

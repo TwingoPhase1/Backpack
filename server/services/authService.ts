@@ -12,11 +12,12 @@ import {
   AuthResponse,
 } from "../../src/types/index.js";
 import { deleteUserDb } from "../db.js";
+import { sqlite, withTransaction, getMeta, setMeta, countUserNotes, hasUserInSqlite, DATA_DIR as SQLITE_DATA_DIR } from "../sqlite.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "../../");
-const DATA_DIR = path.resolve(ROOT_DIR, "data");
+const DATA_DIR = SQLITE_DATA_DIR;
 const USERS_FILE = path.resolve(DATA_DIR, "users.json");
 const SESSIONS_FILE = path.resolve(DATA_DIR, "sessions.json");
 const SESSION_SECRET_FILE = path.resolve(DATA_DIR, ".session_secret");
@@ -122,80 +123,181 @@ class AuthService {
   }
 
   private loadUsers() {
-    if (fs.existsSync(USERS_FILE)) {
-      try {
-        const raw = fs.readFileSync(USERS_FILE, "utf-8");
-        this.users = JSON.parse(raw);
-      } catch (e) {
-        console.error("[-] Erreur lecture users.json :", e);
-        this.users = [];
+    if (!getMeta("migrated_users_json")) {
+      if (fs.existsSync(USERS_FILE)) {
+        try {
+          const raw = fs.readFileSync(USERS_FILE, "utf-8");
+          const parsed: StoredUserRecord[] = JSON.parse(raw);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const insertStmt = sqlite.prepare(
+              "INSERT OR REPLACE INTO users (username, id, name, role, first_login_at, last_login_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            );
+            withTransaction(() => {
+              for (const u of parsed) {
+                insertStmt.run(
+                  u.username,
+                  u.id,
+                  u.name ?? null,
+                  u.role,
+                  u.firstLoginAt ?? null,
+                  u.lastLoginAt ?? null,
+                  JSON.stringify(u)
+                );
+              }
+            });
+            console.log(`[+] Migration SQLite users.json : ${parsed.length} utilisateur(s) importé(s).`);
+          }
+        } catch (e) {
+          console.error("[-] Erreur migration users.json vers SQLite :", e);
+        }
       }
-    } else {
+      setMeta("migrated_users_json", "1");
+    }
+
+    try {
+      const rows = sqlite.prepare("SELECT data FROM users").all() as Array<{ data: string }>;
+      this.users = rows.map((r) => JSON.parse(r.data) as StoredUserRecord);
+    } catch (e) {
+      console.error("[-] Erreur lecture table users SQLite :", e);
       this.users = [];
-      this.saveUsers();
     }
   }
 
   private saveUsers() {
     try {
-      fs.writeFileSync(USERS_FILE, JSON.stringify(this.users, null, 2), "utf-8");
+      const upsertStmt = sqlite.prepare(
+        "INSERT OR REPLACE INTO users (username, id, name, role, first_login_at, last_login_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      );
+      const keepUsernames = new Set(this.users.map((u) => u.username));
+      const existingRows = sqlite.prepare("SELECT username FROM users").all() as Array<{ username: string }>;
+      const deleteStmt = sqlite.prepare("DELETE FROM users WHERE username = ?");
+
+      withTransaction(() => {
+        for (const row of existingRows) {
+          if (!keepUsernames.has(row.username)) {
+            deleteStmt.run(row.username);
+          }
+        }
+        for (const u of this.users) {
+          upsertStmt.run(
+            u.username,
+            u.id,
+            u.name ?? null,
+            u.role,
+            u.firstLoginAt ?? null,
+            u.lastLoginAt ?? null,
+            JSON.stringify(u)
+          );
+        }
+      });
     } catch (e) {
-      console.error("[-] Erreur écriture users.json :", e);
+      console.error("[-] Erreur écriture table users SQLite :", e);
     }
   }
 
   private loadSessions() {
-    if (fs.existsSync(SESSIONS_FILE)) {
-      try {
-        const raw = fs.readFileSync(SESSIONS_FILE, "utf-8");
-        const storedList: StoredSession[] = JSON.parse(raw);
-        const now = Date.now();
-        let loadedCount = 0;
-
-        for (const item of storedList) {
-          // Ignorer les sessions expirées (> 30 jours)
-          if (now - item.lastActive > SESSION_MAX_AGE_MS) continue;
-
-          const password = decrypt(item.encPassword);
-          this.sessions.set(item.token, {
-            token: item.token,
-            user: item.user,
-            credentials: {
-              username: item.user.username,
-              password,
-            },
-            lastActive: item.lastActive,
-          });
-          loadedCount++;
+    const now = Date.now();
+    if (!getMeta("migrated_sessions_json")) {
+      if (fs.existsSync(SESSIONS_FILE)) {
+        try {
+          const raw = fs.readFileSync(SESSIONS_FILE, "utf-8");
+          const storedList: StoredSession[] = JSON.parse(raw);
+          if (Array.isArray(storedList) && storedList.length > 0) {
+            const insertStmt = sqlite.prepare(
+              "INSERT OR REPLACE INTO sessions (token, username, enc_password, last_active, user_data) VALUES (?, ?, ?, ?, ?)"
+            );
+            let imported = 0;
+            withTransaction(() => {
+              for (const item of storedList) {
+                if (now - item.lastActive > SESSION_MAX_AGE_MS) continue;
+                insertStmt.run(
+                  item.token,
+                  item.user.username,
+                  item.encPassword,
+                  item.lastActive,
+                  JSON.stringify(item.user)
+                );
+                imported++;
+              }
+            });
+            if (imported > 0) {
+              console.log(`[+] Migration SQLite sessions.json : ${imported} session(s) importée(s).`);
+            }
+          }
+        } catch (e) {
+          console.error("[-] Erreur migration sessions.json vers SQLite :", e);
         }
-        if (loadedCount > 0) {
-          console.log(`[+] ${loadedCount} session(s) active(s) restaurée(s) depuis le cache persistant.`);
-        }
-      } catch (e) {
-        console.error("[-] Erreur lecture sessions.json :", e);
-        this.sessions.clear();
       }
+      setMeta("migrated_sessions_json", "1");
+    }
+
+    try {
+      sqlite.prepare("DELETE FROM sessions WHERE last_active < ?").run(now - SESSION_MAX_AGE_MS);
+      const rows = sqlite
+        .prepare("SELECT token, username, enc_password, last_active, user_data FROM sessions")
+        .all() as Array<{
+        token: string;
+        username: string;
+        enc_password: string;
+        last_active: number;
+        user_data: string;
+      }>;
+
+      let loadedCount = 0;
+      for (const row of rows) {
+        if (now - row.last_active > SESSION_MAX_AGE_MS) continue;
+        const user = JSON.parse(row.user_data) as User;
+        const password = decrypt(row.enc_password);
+        this.sessions.set(row.token, {
+          token: row.token,
+          user,
+          credentials: {
+            username: user.username,
+            password,
+          },
+          lastActive: row.last_active,
+        });
+        loadedCount++;
+      }
+      if (loadedCount > 0) {
+        console.log(`[+] ${loadedCount} session(s) active(s) restaurée(s) depuis SQLite.`);
+      }
+    } catch (e) {
+      console.error("[-] Erreur lecture table sessions SQLite :", e);
+      this.sessions.clear();
     }
   }
 
   private saveSessions() {
     try {
       const now = Date.now();
-      const listToStore: StoredSession[] = [];
+      const upsertStmt = sqlite.prepare(
+        "INSERT OR REPLACE INTO sessions (token, username, enc_password, last_active, user_data) VALUES (?, ?, ?, ?, ?)"
+      );
+      const existingRows = sqlite.prepare("SELECT token FROM sessions").all() as Array<{ token: string }>;
+      const deleteStmt = sqlite.prepare("DELETE FROM sessions WHERE token = ?");
+      const activeTokens = new Set<string>();
 
-      for (const s of this.sessions.values()) {
-        if (now - s.lastActive > SESSION_MAX_AGE_MS) continue;
-        listToStore.push({
-          token: s.token,
-          user: s.user,
-          encPassword: encrypt(s.credentials.password),
-          lastActive: s.lastActive,
-        });
-      }
-
-      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(listToStore, null, 2), "utf-8");
+      withTransaction(() => {
+        for (const s of this.sessions.values()) {
+          if (now - s.lastActive > SESSION_MAX_AGE_MS) continue;
+          activeTokens.add(s.token);
+          upsertStmt.run(
+            s.token,
+            s.user.username,
+            encrypt(s.credentials.password),
+            s.lastActive,
+            JSON.stringify(s.user)
+          );
+        }
+        for (const row of existingRows) {
+          if (!activeTokens.has(row.token)) {
+            deleteStmt.run(row.token);
+          }
+        }
+      });
     } catch (e) {
-      console.error("[-] Erreur sauvegarde sessions.json :", e);
+      console.error("[-] Erreur sauvegarde table sessions SQLite :", e);
     }
   }
 
@@ -574,14 +676,18 @@ class AuthService {
    */
   public getAllUsers(): AdminUserSummary[] {
     return this.users.map((u) => {
-      // Compter les notes de cet utilisateur si son répertoire existe
-      const userDir = path.resolve(DATA_DIR, "users", u.username, "database.json");
+      const norm = u.username.toLowerCase().trim();
       let notesCount = 0;
-      if (fs.existsSync(userDir)) {
-        try {
-          const raw = JSON.parse(fs.readFileSync(userDir, "utf-8"));
-          notesCount = raw.notes?.length || 0;
-        } catch {}
+      if (hasUserInSqlite(norm)) {
+        notesCount = countUserNotes(norm);
+      } else {
+        const legacyFile = path.resolve(DATA_DIR, "users", u.username, "database.json");
+        if (fs.existsSync(legacyFile)) {
+          try {
+            const raw = JSON.parse(fs.readFileSync(legacyFile, "utf-8"));
+            notesCount = raw.notes?.length || 0;
+          } catch {}
+        }
       }
 
       return {

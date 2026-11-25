@@ -12,6 +12,7 @@ import { LessonsPlanner } from "./LessonsPlanner";
 import { ResourceSlidesTab } from "./ResourceSlidesTab";
 import { TDExerciseGeneratorModal } from "./TDExerciseGeneratorModal";
 import { ResourceQCMTab } from "./ResourceQCMTab";
+import { AddToSpaceModal } from "./AddToSpaceModal";
 import {
   BookOpen,
   Laptop,
@@ -45,6 +46,7 @@ import {
   PenTool,
   Sparkles,
   HelpCircle,
+  FolderPlus,
 } from "lucide-react";
 
 interface ResourceViewProps {
@@ -78,6 +80,7 @@ export const ResourceView: React.FC<ResourceViewProps> = ({
   const [selectedMoodleSectionId, setSelectedMoodleSectionId] = useState<string>("ALL");
   const [expandedMoodleSubsections, setExpandedMoodleSubsections] = useState<Record<string, boolean>>({});
   const [moodleViewerTarget, setMoodleViewerTarget] = useState<MoodleViewerTarget | null>(null);
+  const [addToSpaceFile, setAddToSpaceFile] = useState<{ name: string; url: string } | null>(null);
   const [copiedFileId, setCopiedFileId] = useState<string | null>(null);
   const [createSlideTrigger, setCreateSlideTrigger] = useState(0);
   const [createQCMTrigger, setCreateQCMTrigger] = useState(0);
@@ -1397,14 +1400,29 @@ export const ResourceView: React.FC<ResourceViewProps> = ({
 
                                         {/* Direct download if file */}
                                         {downloadUrl && (
-                                          <a
-                                            href={downloadUrl}
-                                            download
-                                            className="p-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg text-xs font-semibold transition-colors flex items-center"
-                                            title="Télécharger"
-                                          >
-                                            <Download className="w-3.5 h-3.5" />
-                                          </a>
+                                          <>
+                                            <button
+                                              onClick={() =>
+                                                setAddToSpaceFile({
+                                                  name: cleanName,
+                                                  url: file?.url || mod.url,
+                                                })
+                                              }
+                                              className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 cursor-pointer"
+                                              title="Ajouter à mon espace (CM / TP / TD)"
+                                            >
+                                              <FolderPlus className="w-3.5 h-3.5" />
+                                              <span className="hidden md:inline">Mon espace</span>
+                                            </button>
+                                            <a
+                                              href={downloadUrl}
+                                              download
+                                              className="p-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg text-xs font-semibold transition-colors flex items-center"
+                                              title="Télécharger"
+                                            >
+                                              <Download className="w-3.5 h-3.5" />
+                                            </a>
+                                          </>
                                         )}
                                       </div>
                                     </div>
@@ -1463,6 +1481,21 @@ export const ResourceView: React.FC<ResourceViewProps> = ({
       <MoodleViewerModal
         target={moodleViewerTarget}
         onClose={() => setMoodleViewerTarget(null)}
+      />
+
+      <AddToSpaceModal
+        isOpen={!!addToSpaceFile}
+        onClose={() => setAddToSpaceFile(null)}
+        fileName={addToSpaceFile?.name || ""}
+        fileUrl={addToSpaceFile?.url || ""}
+        sourceLabel="Moodle"
+        defaultResourceCode={resource.code}
+        onSuccess={(targetResId, targetType) => {
+          if (targetResId === resource.id) {
+            fetchNotes();
+            setActiveTab(targetType);
+          }
+        }}
       />
     </div>
   );

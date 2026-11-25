@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { MoodleCourse, MoodleFile } from "../types";
+import { api } from "../services/api";
 import {
   FolderArchive,
   Search,
@@ -315,7 +316,7 @@ const FileRow: React.FC<FileRowProps> = ({ file, onInsert, onCopy, isInserted, i
 
         {/* Download directly */}
         <a
-          href={`/api/moodle/download?url=${encodeURIComponent(file.url)}`}
+          href={api.getMoodleDownloadUrl(file.url)}
           target="_blank"
           rel="noreferrer"
           className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-md transition-colors"

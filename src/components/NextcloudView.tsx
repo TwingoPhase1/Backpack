@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { NextcloudItem, NextcloudStatus, Resource } from "../types";
 import { api } from "../services/api";
+import { AddToSpaceModal } from "./AddToSpaceModal";
 import {
   Cloud,
   Folder,
@@ -24,6 +25,8 @@ import {
   FileSpreadsheet,
   File,
   Sparkles,
+  FolderPlus,
+  Eye,
 } from "lucide-react";
 
 interface NextcloudViewProps {
@@ -51,6 +54,7 @@ export const NextcloudView: React.FC<NextcloudViewProps> = ({
   const [importTitle, setImportTitle] = useState<string>("");
   const [isImporting, setIsImporting] = useState<boolean>(false);
   const [importSuccessMessage, setImportSuccessMessage] = useState<string | null>(null);
+  const [addToSpaceItem, setAddToSpaceItem] = useState<NextcloudItem | null>(null);
 
   const fetchStatus = async () => {
     try {
@@ -433,6 +437,29 @@ export const NextcloudView: React.FC<NextcloudViewProps> = ({
                               )}
                             </button>
 
+                            {/* Open in new tab */}
+                            <a
+                              href={api.getNextcloudDownloadUrl(item.path)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1"
+                              title="Ouvrir le fichier"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span className="hidden sm:inline">Ouvrir</span>
+                            </a>
+
+                            {/* Add to my space (CM / TP / TD) */}
+                            <button
+                              type="button"
+                              onClick={() => setAddToSpaceItem(item)}
+                              className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+                              title="Ajouter à mon espace (Cours, TP ou TD)"
+                            >
+                              <FolderPlus className="w-3.5 h-3.5" />
+                              <span className="hidden md:inline">Mon espace</span>
+                            </button>
+
                             {/* Download Button */}
                             <a
                               href={api.getNextcloudDownloadUrl(item.path)}
@@ -574,6 +601,16 @@ export const NextcloudView: React.FC<NextcloudViewProps> = ({
             )}
           </div>
         </div>
+      )}
+      {addToSpaceItem && (
+        <AddToSpaceModal
+          isOpen={Boolean(addToSpaceItem)}
+          onClose={() => setAddToSpaceItem(null)}
+          fileName={addToSpaceItem.name}
+          fileUrl={api.getNextcloudDownloadUrl(addToSpaceItem.path)}
+          sourceLabel="UniCloud"
+          defaultResourceCode={addToSpaceItem.resourceCode}
+        />
       )}
     </div>
   );
