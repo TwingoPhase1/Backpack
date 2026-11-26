@@ -943,6 +943,8 @@ export class AIService {
           apiKey: profile.apiKey || userConfig.providers?.[profile.provider]?.apiKey,
           baseUrl: profile.baseUrl || userConfig.providers?.[profile.provider]?.baseUrl,
           model: profile.model,
+          proactiveModel: undefined,
+          documentModel: undefined,
         },
       },
     };
@@ -1228,6 +1230,26 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
   /**
    * Appelle l'API du provider sélectionné (Ollama, OpenRouter, Claude, Mistral, Google)
    */
+  public async generateSimpleText(
+    userConfig: AIUserConfig,
+    prompt: string,
+    timeoutMs = 20000
+  ): Promise<string> {
+    const provider = userConfig.activeProvider;
+    const providerConfig = userConfig.providers?.[provider] || {};
+    const callPromise = this.callProvider(
+      provider,
+      providerConfig,
+      [{ role: "user", content: prompt }],
+      false
+    ).then((msg) => msg.content || "");
+
+    const timeoutPromise = new Promise<string>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout IA (${Math.round(timeoutMs / 1000)}s)`)), timeoutMs)
+    );
+    return Promise.race([callPromise, timeoutPromise]);
+  }
+
   private async callProvider(
     provider: AIProvider,
     config: { apiKey?: string; baseUrl?: string; model?: string },
@@ -1614,12 +1636,7 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
       }));
     }
 
-    const isGemini = options.providerLabel.toLowerCase().includes("gemini");
-    const fallbackModels = isGemini
-      ? [model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"].filter(
-          (m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx
-        )
-      : [model];
+    const fallbackModels = [model].filter((m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx);
 
     let res: Response | null = null;
     let lastErrText = "";
@@ -1715,7 +1732,7 @@ Formate toujours tes réponses en Markdown élégant avec du LaTeX ($...$) pour 
       providerLabel: "Google Gemini",
       endpoint: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
       apiKey: config.apiKey,
-      defaultModel: "gemini-2.5-flash",
+      defaultModel: "gemini-3.8-flash",
       model: config.model,
       messages,
       includeTools,
@@ -2650,40 +2667,50 @@ RÈGLES STRICTES :
     if (provider === "google" && providerConfig.apiKey) {
       const model = providerConfig.model || "gemini-2.5-flash";
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(providerConfig.apiKey)}`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: promptText }] }],
-          tools: [{ google_search: {} }],
-        }),
-      });
-      const json: any = await res.json().catch(() => ({}));
-      if (res.ok && json?.candidates?.[0]) {
-        const cand = json.candidates[0];
-        const parts = Array.isArray(cand.content?.parts) ? cand.content.parts : [];
-        const nonThoughtParts = parts.filter((p: any) => !p.thought && p.text);
-        const answer = (nonThoughtParts.length > 0 ? nonThoughtParts : parts)
-          .map((p: any) => p.text || "")
-          .join("")
-          .trim();
-        const chunks = cand.groundingMetadata?.groundingChunks || [];
-        const sources: Array<{ title: string; url: string }> = [];
-        const seen = new Set<string>();
-        for (const ch of chunks) {
-          const uri = ch?.web?.uri;
-          const title = ch?.web?.title || uri;
-          if (uri && !seen.has(uri)) {
-            seen.add(uri);
-            sources.push({ title, url: uri });
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: promptText }] }],
+            tools: [{ google_search: {} }],
+          }),
+        });
+        const json: any = await res.json().catch(() => ({}));
+        if (res.ok && json?.candidates?.[0]) {
+          const cand = json.candidates[0];
+          const parts = Array.isArray(cand.content?.parts) ? cand.content.parts : [];
+          const nonThoughtParts = parts.filter((p: any) => !p.thought && p.text);
+          const answer = (nonThoughtParts.length > 0 ? nonThoughtParts : parts)
+            .map((p: any) => p.text || "")
+            .join("")
+            .trim();
+          const chunks = cand.groundingMetadata?.groundingChunks || [];
+          const sources: Array<{ title: string; url: string }> = [];
+          const seen = new Set<string>();
+          for (const ch of chunks) {
+            const uri = ch?.web?.uri;
+            const title = ch?.web?.title || uri;
+            if (uri && !seen.has(uri)) {
+              seen.add(uri);
+              sources.push({ title, url: uri });
+            }
           }
+          return {
+            answer: answer || "Aucune réponse générée.",
+            sources,
+            provider: `Google (${model})`,
+            webSearchUsed: true,
+          };
         }
-        return {
-          answer: answer || "Aucune réponse générée.",
-          sources,
-          provider: `Google (${model})`,
-          webSearchUsed: true,
-        };
+        if (res.status === 429 || res.status === 503) {
+          throw new Error(`Erreur Google (${res.status}): ${json?.error?.message || "Modèle saturé"}`);
+        }
+      } catch (err: any) {
+        const formatted = this.formatFriendlyAIError(err);
+        if (formatted.isSaturated) {
+          throw new Error(formatted.message);
+        }
       }
     }
 
@@ -2763,7 +2790,10 @@ RÈGLES STRICTES :
     return {
       answer: msg.content || "Aucune réponse générée.",
       sources: webResults.map((r) => ({ title: r.title, url: r.url })),
-      provider: provider,
+      provider:
+        provider === "google" && providerConfig.model
+          ? `Google (${providerConfig.model})`
+          : provider,
       webSearchUsed: webResults.length > 0,
     };
   }
@@ -2943,6 +2973,57 @@ ${questionsBlock}`;
     };
   }
 
+  public formatFriendlyAIError(err: any): {
+    message: string;
+    statusCode: number;
+    isSaturated: boolean;
+  } {
+    const raw = String(err?.message || err || "").trim();
+    const lower = raw.toLowerCase();
+    const isQuotaOrOverload =
+      lower.includes("429") ||
+      lower.includes("503") ||
+      lower.includes("529") ||
+      lower.includes("resource_exhausted") ||
+      lower.includes("quota") ||
+      lower.includes("rate limit") ||
+      lower.includes("too many requests") ||
+      lower.includes("overloaded") ||
+      lower.includes("high demand") ||
+      lower.includes("capacity") ||
+      lower.includes("saturé") ||
+      lower.includes("satur");
+    const isNetworkOrFetch =
+      lower.includes("fetch failed") ||
+      lower.includes("failed to fetch") ||
+      lower.includes("econnreset") ||
+      lower.includes("etimedout") ||
+      lower.includes("enotfound") ||
+      lower.includes("network") ||
+      lower.includes("socket") ||
+      lower.includes("aborted");
+
+    if (isQuotaOrOverload) {
+      return {
+        message: "Modèle IA saturé ou limite de requêtes atteinte. Patientez quelques secondes puis cliquez sur Renvoyer.",
+        statusCode: 429,
+        isSaturated: true,
+      };
+    }
+    if (isNetworkOrFetch) {
+      return {
+        message: "Le modèle IA est temporairement injoignable ou surchargé (connexion interrompue). Cliquez sur Renvoyer.",
+        statusCode: 503,
+        isSaturated: true,
+      };
+    }
+    return {
+      message: raw || "Erreur lors de l'appel au modèle IA.",
+      statusCode: 500,
+      isSaturated: false,
+    };
+  }
+
   public async answerQuizQuestionsBatchWithWebSearch(
     userConfig: AIUserConfig,
     questions: Array<{ id: string; questionText: string; choicesText: string[] }>
@@ -2963,7 +3044,7 @@ ${questionsBlock}`;
       return { results: {}, provider: userConfig.activeProvider, webSearchUsed: false };
     }
 
-    const CHUNK_SIZE = 3;
+    const CHUNK_SIZE = 6;
     const allResults: Record<
       string,
       {

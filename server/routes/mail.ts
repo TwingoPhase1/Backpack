@@ -150,7 +150,7 @@ router.post("/triage", async (req, res) => {
   try {
     const currentDb = req.userDb || db;
     const creds = req.credentials;
-    const aiConfig = aiService.resolveConfigForRole(currentDb.getAIConfig(), "mail_compose");
+    const aiConfig = aiService.resolveConfigForRole(currentDb.getAIConfig(), "mail_triage");
     if (!aiConfig.enabled) {
       return res.status(400).json({ error: "Activez l'IA dans les paramètres pour utiliser le triage automatique." });
     }
@@ -304,7 +304,7 @@ router.post("/staff", async (req, res) => {
 
     // Si on ajoute le staff depuis un mail ouvert et que l'IA est activée, analyser immédiatement ce mail pour l'EDT
     let actions: Array<{ action: string; summary: string; eventId?: string; visioUrl?: string }> = [];
-    const aiConfig = aiService.resolveConfigForRole(currentDb.getAIConfig(), "mail_compose");
+    const aiConfig = aiService.resolveConfigForRole(currentDb.getAIConfig(), "schedule_agent");
     if (mailId && aiConfig.enabled) {
       try {
         const detail = await mailService.getMessage(String(mailId), creds, folder || "INBOX");

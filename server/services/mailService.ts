@@ -553,7 +553,10 @@ export class MailService {
     ) {
       try {
         const names = currentDb.getUniqueScheduleTeacherNames();
-        const resolved = await this.resolveTeachersFromGal(names, creds);
+        const resolved = await Promise.race([
+          this.resolveTeachersFromGal(names, creds),
+          new Promise<Array<{ name: string; email: string }>>((resolve) => setTimeout(() => resolve([]), 4000)),
+        ]);
         if (resolved.length > 0) {
           const nowIso = new Date().toISOString();
           currentDb.upsertAuthorizedSenders(
@@ -567,7 +570,7 @@ export class MailService {
 
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
 
-    for (const item of items) {
+    const processSingleItem = async (item: typeof items[number]) => {
       const key = item.messageId ? String(item.messageId).trim() : `uid:${item.id}`;
       const existingMeta = triageMap[key];
       const authorizedSender = currentDb.isAuthorizedSender(item.from || "", item.senderName);
@@ -616,13 +619,13 @@ export class MailService {
             };
             this.saveTriageEntry(creds?.username, key, updatedMeta);
             triagedOutput[item.id] = updatedMeta;
-            continue;
+            return;
           } catch (e) {
             console.warn(`[-] Traitement EDT IA ignoré pour ${item.id}:`, e);
           }
         }
         triagedOutput[item.id] = existingMeta;
-        continue;
+        return;
       }
 
       const rawBodyText = await ensureBodyText();
@@ -693,14 +696,8 @@ Objet : ${item.subject || ""}
 Contenu :
 ${cleanedBodyForLLM}`;
               const triageAiConfig = aiService.resolveConfigForRole(aiConfig, "mail_triage");
-              const tempConfig: AIUserConfig = { ...triageAiConfig, enableTools: false };
-              const sumResult = await aiService.chatWithAgent(
-                tempConfig,
-                [{ role: "user", content: notifPrompt }],
-                currentDb,
-                creds
-              );
-              const raw = (sumResult.message.content || "").replace(/```json\s*|\s*```/g, "").trim();
+              const rawContent = await aiService.generateSimpleText(triageAiConfig, notifPrompt, 18000);
+              const raw = rawContent.replace(/```json\s*|\s*```/g, "").trim();
               const match = raw.match(/\{[\s\S]*\}/);
               if (match) {
                 try {
@@ -741,14 +738,8 @@ Objet : ${item.subject || ""}
 Contenu :
 ${cleanedBodyForLLM}`;
               const triageAiConfig = aiService.resolveConfigForRole(aiConfig, "mail_triage");
-              const tempConfig: AIUserConfig = { ...triageAiConfig, enableTools: false };
-              const sumResult = await aiService.chatWithAgent(
-                tempConfig,
-                [{ role: "user", content: summaryPrompt }],
-                currentDb,
-                creds
-              );
-              const cleanedSum = (sumResult.message.content || "")
+              const sumText = await aiService.generateSimpleText(triageAiConfig, summaryPrompt, 18000);
+              const cleanedSum = sumText
                 .replace(/^["«»\s]+|["«»\s]+$/g, "")
                 .replace(/\s+/g, " ")
                 .trim();
@@ -775,7 +766,7 @@ ${cleanedBodyForLLM}`;
           };
           this.saveTriageEntry(creds?.username, key, meta);
           triagedOutput[item.id] = meta;
-          continue;
+          return;
         }
 
         // 2. Fallback LLM standard si gemini-decision-1 n'est pas disponible
@@ -797,14 +788,7 @@ Contenu :
 ${cleanedBodyForLLM}`;
 
         const triageAiConfig = aiService.resolveConfigForRole(aiConfig, "mail_triage");
-        const tempConfig: AIUserConfig = { ...triageAiConfig, enableTools: false };
-        const result = await aiService.chatWithAgent(
-          tempConfig,
-          [{ role: "user", content: prompt }],
-          currentDb,
-          creds
-        );
-        const raw = result.message.content || "";
+        const raw = await aiService.generateSimpleText(triageAiConfig, prompt, 20000);
         const cleaned = raw.replace(/```json\s*|\s*```/g, "").trim();
         const match = cleaned.match(/\{[\s\S]*\}/);
         if (match) {
@@ -899,6 +883,11 @@ ${cleanedBodyForLLM}`;
           } catch {}
         }
       }
+    };
+
+    const CONCURRENCY = 3;
+    for (let i = 0; i < items.length; i += CONCURRENCY) {
+      await Promise.all(items.slice(i, i + CONCURRENCY).map(processSingleItem));
     }
 
     return triagedOutput;

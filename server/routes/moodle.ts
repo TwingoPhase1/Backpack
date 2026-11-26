@@ -1139,7 +1139,34 @@ router.get("/download", async (req, res) => {
     return res.status(400).json({ error: "URL de téléchargement invalide" });
   }
 
-  const performProxy = (urlToFetch: string, hasRetried: boolean) => {
+  const extractMoodlePluginFileUrl = (html: string, baseUrl: string): string | null => {
+    const decodeEntities = (s: string) =>
+      s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#039;/g, "'");
+    const patterns = [
+      /<div[^>]*class=["'][^"']*resourceworkaround[^"']*["'][^>]*>[\s\S]*?<a[^>]*href=["']([^"']*pluginfile\.php[^"']+)["']/i,
+      /<(?:object|iframe|embed)[^>]*id=["']resourceobject["'][^>]*(?:data|src)=["']([^"']*pluginfile\.php[^"']+)["']/i,
+      /<(?:object|iframe|embed)[^>]*(?:data|src)=["']([^"']*pluginfile\.php[^"']+)["']/i,
+      /href=["'](https?:\/\/[^"']*ecampus\.unicaen\.fr\/pluginfile\.php\/\d+\/mod_resource\/[^"']+)["']/i,
+      /["'](https?:\/\/[^"']*ecampus\.unicaen\.fr\/pluginfile\.php\/[^"']+)["']/i,
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m?.[1]) {
+        try {
+          return new URL(decodeEntities(m[1]), baseUrl).toString();
+        } catch {
+          // ignore malformed URL
+        }
+      }
+    }
+    return null;
+  };
+
+  const performProxy = (urlToFetch: string, hasRetried: boolean, depth = 0) => {
+    if (depth > 6) {
+      if (!res.headersSent) res.status(508).json({ error: "Trop de redirections Moodle" });
+      return;
+    }
     const cookieHeader = buildMoodleCookieHeader();
     const parsed = new URL(urlToFetch);
     const options = {
@@ -1158,12 +1185,12 @@ router.get("/download", async (req, res) => {
       if (proxyRes.statusCode && proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
         const redirectLocation = new URL(proxyRes.headers.location, urlToFetch).toString();
         proxyRes.resume();
-        if (redirectLocation.includes("cas.unicaen.fr")) {
+        if (redirectLocation.includes("cas.unicaen.fr") || redirectLocation.includes("/login/index.php")) {
           if (!hasRetried) {
             try {
               await runMoodleScraper(true);
-              return performProxy(urlToFetch, true);
-            } catch (e) {
+              return performProxy(urlToFetch, true, depth);
+            } catch {
               if (!res.headersSent) return res.status(401).json({ error: "Session Moodle expirée" });
               return;
             }
@@ -1171,20 +1198,64 @@ router.get("/download", async (req, res) => {
           if (!res.headersSent) return res.status(401).json({ error: "Session Moodle expirée" });
           return;
         }
-        const qs = new URLSearchParams({ url: redirectLocation });
-        if (inline) qs.set("inline", "1");
-        if (token) qs.set("token", token);
-        if (hasRetried) qs.set("retried", "1");
-        return res.redirect(`/api/moodle/download?${qs.toString()}`);
+        return performProxy(redirectLocation, hasRetried, depth + 1);
+      }
+
+      const contentType = String(proxyRes.headers["content-type"] || "").toLowerCase();
+      if (contentType.includes("text/html")) {
+        const chunks: Buffer[] = [];
+        proxyRes.on("data", (chunk: Buffer) => chunks.push(chunk));
+        proxyRes.on("end", async () => {
+          const html = Buffer.concat(chunks).toString("utf-8");
+
+          // Détecter une page de connexion CAS/Moodle renvoyée en 200 OK
+          if (
+            !hasRetried &&
+            (html.includes("cas.unicaen.fr/cas/login") ||
+              (html.includes("login/index.php") && html.includes('name="username"')))
+          ) {
+            try {
+              await runMoodleScraper(true);
+              return performProxy(urlToFetch, true, depth);
+            } catch {
+              if (!res.headersSent) return res.status(401).json({ error: "Session Moodle expirée" });
+              return;
+            }
+          }
+
+          // Extraire le vrai lien pluginfile.php depuis les pages wrapper mod/resource/view.php
+          const realFileUrl = extractMoodlePluginFileUrl(html, urlToFetch);
+          if (realFileUrl && realFileUrl !== urlToFetch) {
+            return performProxy(realFileUrl, hasRetried, depth + 1);
+          }
+
+          if (!res.headersSent) {
+            res.status(proxyRes.statusCode || 200);
+            res.setHeader("Content-Type", proxyRes.headers["content-type"] || "text/html; charset=utf-8");
+            res.send(html);
+          }
+        });
+        return;
       }
 
       res.status(proxyRes.statusCode || 200);
       for (const [key, val] of Object.entries(proxyRes.headers)) {
         if (!val || ["set-cookie", "content-security-policy", "x-frame-options"].includes(key.toLowerCase())) continue;
-        if (inline && key.toLowerCase() === "content-disposition" && typeof val === "string") {
-          res.setHeader(key, val.replace(/^attachment/i, "inline"));
+        if (key.toLowerCase() === "content-disposition" && typeof val === "string") {
+          res.setHeader(
+            key,
+            inline
+              ? val.replace(/^attachment/i, "inline")
+              : val.replace(/^inline/i, "attachment")
+          );
         } else {
           res.setHeader(key, val);
+        }
+      }
+      if (!inline && !proxyRes.headers["content-disposition"]) {
+        const inferredName = decodeURIComponent(parsed.pathname.split("/").pop() || "fichier");
+        if (inferredName && inferredName.includes(".")) {
+          res.setHeader("Content-Disposition", `attachment; filename="${inferredName.replace(/"/g, "")}"`);
         }
       }
       proxyRes.pipe(res);
@@ -1200,7 +1271,7 @@ router.get("/download", async (req, res) => {
     proxyReq.end();
   };
 
-  performProxy(targetUrl, retried);
+  performProxy(targetUrl, retried, 0);
 });
 
 export default router;

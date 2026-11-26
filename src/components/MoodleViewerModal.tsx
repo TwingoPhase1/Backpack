@@ -23,8 +23,37 @@ import {
   ChevronLeft,
   ChevronRight,
   FolderPlus,
+  RefreshCw,
 } from "lucide-react";
 import { AddToSpaceModal } from "./AddToSpaceModal";
+
+function formatQuizAiError(rawMsg?: string): string {
+  const raw = String(rawMsg || "").trim();
+  const lower = raw.toLowerCase();
+  if (
+    lower.includes("429") ||
+    lower.includes("503") ||
+    lower.includes("529") ||
+    lower.includes("resource_exhausted") ||
+    lower.includes("quota") ||
+    lower.includes("rate limit") ||
+    lower.includes("overloaded") ||
+    lower.includes("saturé") ||
+    lower.includes("satur")
+  ) {
+    return "Modèle IA saturé ou limite de requêtes atteinte. Patientez un instant puis cliquez sur Renvoyer.";
+  }
+  if (
+    lower.includes("fetch failed") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("networkerror") ||
+    lower.includes("econnreset") ||
+    lower.includes("etimedout")
+  ) {
+    return "Modèle IA temporairement saturé ou injoignable (connexion interrompue). Cliquez sur Renvoyer.";
+  }
+  return raw || "Erreur lors de l'analyse IA. Cliquez sur Renvoyer.";
+}
 
 function isOptionSuggestedByAI(
   answer: string | undefined,
@@ -267,9 +296,13 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
       const allQ = (attempt.allQuestions?.length ? attempt.allQuestions : attempt.questions || []) as QuizQuestionItem[];
       setAllQuizQuestions(allQ);
       if (allQ.length > 0) {
-        setActiveQuestionId(attempt.questions[0]?.id || allQ[0]?.id || null);
-        // Traiter les questions par paquets de 3
-        void handleAskQuizAIBatch(allQ);
+        const currentQuestionId = attempt.questions[0]?.id || allQ[0]?.id || null;
+        setActiveQuestionId(currentQuestionId);
+        // Si le quiz est repris en cours de route, démarrer l'IA à la question actuelle
+        const startIdx = currentQuestionId ? allQ.findIndex((q) => q.id === currentQuestionId) : 0;
+        const orderedQ =
+          startIdx > 0 ? [...allQ.slice(startIdx), ...allQ.slice(0, startIdx)] : allQ;
+        void handleAskQuizAIBatch(orderedQ);
       }
     } catch (err: any) {
       setError(err.message || "Impossible de démarrer le questionnaire.");
@@ -402,10 +435,11 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
       return next;
     });
 
-    const BATCH_SIZE = 3;
+    // D'abord les 3 premières questions, puis dès réception, les 6 suivantes (et paquets de 6)
     const chunks: QuizQuestionItem[][] = [];
-    for (let i = 0; i < pendingQuestions.length; i += BATCH_SIZE) {
-      chunks.push(pendingQuestions.slice(i, i + BATCH_SIZE));
+    chunks.push(pendingQuestions.slice(0, 3));
+    for (let i = 3; i < pendingQuestions.length; i += 6) {
+      chunks.push(pendingQuestions.slice(i, i + 6));
     }
 
     for (const chunk of chunks) {
@@ -425,20 +459,49 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                 webSearchUsed: item.webSearchUsed,
               };
             } else {
-              next[q.id] = { loading: false, error: "Réponse non reçue dans le batch" };
+              next[q.id] = {
+                loading: false,
+                error: "Réponse non reçue (modèle peut-être saturé). Cliquez sur Renvoyer.",
+              };
             }
           }
           return next;
         });
       } catch (err: any) {
+        const friendlyErr = formatQuizAiError(err?.message);
         setQuizAiHelp((prev) => {
           const next = { ...prev };
           for (const q of chunk) {
-            next[q.id] = { loading: false, error: err.message || "Erreur assistance IA batch" };
+            next[q.id] = { loading: false, error: friendlyErr };
           }
           return next;
         });
       }
+    }
+  };
+
+  const handleRetryQuizAIQuestion = async (q: QuizQuestionItem) => {
+    setQuizAiHelp((prev) => ({
+      ...prev,
+      [q.id]: { loading: true },
+    }));
+    try {
+      const res = await api.getMoodleQuizAIHelp(extractQuestionPayload(q));
+      setQuizAiHelp((prev) => ({
+        ...prev,
+        [q.id]: {
+          loading: false,
+          answer: res.answer,
+          sources: res.sources,
+          provider: res.provider,
+          webSearchUsed: res.webSearchUsed,
+        },
+      }));
+    } catch (err: any) {
+      setQuizAiHelp((prev) => ({
+        ...prev,
+        [q.id]: { loading: false, error: formatQuizAiError(err?.message) },
+      }));
     }
   };
 
@@ -974,7 +1037,18 @@ export const MoodleViewerModal: React.FC<MoodleViewerModalProps> = ({ target, on
                         </div>
 
                         {!aiState.loading && (aiState.error ? (
-                          <p className="text-xs text-rose-700">{aiState.error}</p>
+                          <div className="flex items-center justify-between gap-3 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+                            <p className="text-xs text-rose-800 font-medium">{aiState.error}</p>
+                            <button
+                              type="button"
+                              onClick={() => void handleRetryQuizAIQuestion(q)}
+                              className="px-2.5 py-1.5 bg-white hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 shrink-0 cursor-pointer shadow-xs"
+                              title="Renvoyer cette question à l'IA"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              <span>Renvoyer</span>
+                            </button>
+                          </div>
                         ) : (
                           <>
                             <div className="prose prose-sm prose-slate max-w-none text-xs leading-relaxed">

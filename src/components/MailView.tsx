@@ -369,25 +369,29 @@ export const MailView: React.FC<MailViewProps> = ({
 
     setTriaging(true);
     try {
-      const res = await api.triageMail(
-        targets.map((m) => ({
-          id: m.id,
-          messageId: m.messageId,
-          subject: m.subject,
-          from: m.from,
-          date: m.date,
-        })),
-        targetFolder
-      );
-      if (res.triaged) {
-        setMessages((prev) =>
-          prev.map((m) =>
-            res.triaged[m.id] ? { ...m, ...res.triaged[m.id], aiTriaged: true } : m
-          )
+      const CHUNK_SIZE = 2;
+      for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
+        const chunk = targets.slice(i, i + CHUNK_SIZE);
+        const res = await api.triageMail(
+          chunk.map((m) => ({
+            id: m.id,
+            messageId: m.messageId,
+            subject: m.subject,
+            from: m.from,
+            date: m.date,
+          })),
+          targetFolder
         );
-        setSelectedDetail((prev) =>
-          prev && res.triaged[prev.id] ? { ...prev, ...res.triaged[prev.id], aiTriaged: true } : prev
-        );
+        if (res.triaged) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              res.triaged[m.id] ? { ...m, ...res.triaged[m.id], aiTriaged: true } : m
+            )
+          );
+          setSelectedDetail((prev) =>
+            prev && res.triaged[prev.id] ? { ...prev, ...res.triaged[prev.id], aiTriaged: true } : prev
+          );
+        }
       }
     } catch (e: any) {
       if (!silent) {
